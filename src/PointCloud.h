@@ -2,9 +2,12 @@
 #include <vector>
 #include <string>
 
+#include <cstdint>
+
 struct Point3D {
-    float x, y, z;
-    float intensity; // normalized to [0,1]
+    float   x, y, z;
+    float   intensity; // normalized to [0,1]
+    int64_t ts_ns = 0; // GPS time cast from gps_time field (0 if unavailable)
 };
 
 struct PointCloud {

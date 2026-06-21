@@ -21,6 +21,9 @@
 #include <cstring>
 #include <cstdint>
 #include <cmath>
+#include <thread>
+#include <mutex>
+#include <atomic>
 
 namespace fs = std::filesystem;
 
@@ -28,28 +31,34 @@ namespace fs = std::filesystem;
 // colorPacked: float bits = 0x00RRGGBB; colorMode: 0=jet depth, 1=RGB
 static const char* kVS = R"(
 #version 330
-layout(location = 0) in vec3 pos;
+layout(location = 0) in vec3  pos;
 layout(location = 1) in float colorPacked;
-uniform mat4 mvp;
+layout(location = 2) in float lidarIntensity;
+uniform mat4  mvp;
 uniform float pointSize;
-out float fragDist;
+uniform int   drawDecim;
+out float fragIntensity;
 out vec4 vertColor;
 void main() {
+    if (drawDecim > 1 && (gl_VertexID % drawDecim) != 0) {
+        gl_Position  = vec4(2.0, 2.0, 2.0, 1.0);
+        gl_PointSize = 0.0;
+        return;
+    }
     gl_Position  = mvp * vec4(pos, 1.0);
     gl_PointSize = pointSize;
-    fragDist     = length(pos);
     uint p = floatBitsToUint(colorPacked);
-    vertColor = vec4(float((p >> 16) & 0xFFu) / 255.0,
-                     float((p >>  8) & 0xFFu) / 255.0,
-                     float( p        & 0xFFu) / 255.0,
-                     1.0);
+    float r = float((p >> 16) & 0xFFu) / 255.0;
+    float g = float((p >>  8) & 0xFFu) / 255.0;
+    float b = float( p        & 0xFFu) / 255.0;
+    fragIntensity = lidarIntensity;
+    vertColor = vec4(r, g, b, 1.0);
 }
 )";
 static const char* kFS = R"(
 #version 330
-in float fragDist;
+in float fragIntensity;
 in vec4 vertColor;
-uniform float maxDist;
 uniform int colorMode;
 out vec4 finalColor;
 vec3 jet(float t) {
@@ -60,7 +69,7 @@ vec3 jet(float t) {
 }
 void main() {
     if (colorMode == 1) finalColor = vertColor;
-    else finalColor = vec4(jet(fragDist / max(maxDist, 1.0)), 1.0);
+    else finalColor = vec4(jet(fragIntensity), 1.0);
 }
 )";
 
@@ -76,13 +85,15 @@ struct GpuCloud {
         vao = rlLoadVertexArray();
         rlEnableVertexArray(vao);
         vbo = rlLoadVertexBuffer(data.data(), (int)(data.size()*sizeof(float)), false);
-        const int stride = 4 * sizeof(float);
+        const int stride = 5 * sizeof(float);
         rlSetVertexAttribute(0, 3, RL_FLOAT, false, stride, 0);
         rlEnableVertexAttribute(0);
         rlSetVertexAttribute(1, 1, RL_FLOAT, false, stride, 3*sizeof(float));
         rlEnableVertexAttribute(1);
+        rlSetVertexAttribute(2, 1, RL_FLOAT, false, stride, 4*sizeof(float));
+        rlEnableVertexAttribute(2);
         rlDisableVertexArray();
-        count = (int)(data.size() / 4);
+        count = (int)(data.size() / 5);
     }
     void unload() {
         if (vao) { rlUnloadVertexArray(vao); vao = 0; }
@@ -130,6 +141,7 @@ struct Orbit {
 
 struct ColorPt { float x, y, z; uint8_t r, g, b; };
 
+
 // ── Application state ─────────────────────────────────────────────────────────
 struct State {
     Trajectory           traj;
@@ -140,13 +152,12 @@ struct State {
     int                  imgW = 4656, imgH = 3496;
 
     // loaded camera images: timestamp → resized BGR Mat
-    std::map<int64_t, cv::Mat> images;
-    float imgScale = 0.25f;  // resize factor when loading
-
+    std::map<int64_t, std::string> imagesFilenamesInTime;
+    const float imgScale = 1.0f;
     GpuCloud             cloud;
     Shader               shader = {};
     bool                 shaderOk = false;
-    int                  locMVP = -1, locPS = -1, locMD = -1, locCM = -1;
+    int                  locMVP = -1, locPS = -1, locCM = -1, locDecim = -1;
 
     Orbit                orbit;
 
@@ -155,14 +166,29 @@ struct State {
     bool  showFrustums  = true;
     float frustumScale  = 0.5f;
     float pointSize     = 2.f;
-    int   cloudDecim    = 1;
-    bool  useImageColor = false;  // set when images+calib available after load
+    int   cloudDecim      = 1;
+    int   drawDecim       = 1;
+    bool  multiImgColoring = true;  // false = single image per chunk (midpoint)
+    bool  useImageColor   = false;
 
     char  sessionBuf[512] = {};
     char  calibBuf[512]   = {};
+    char  cameraBuf[512]  = {};
     char  exportBuf[512]  = "colored.laz";
     std::vector<ColorPt> exportCloud;
     std::string status;
+
+    // ── image viewer ────────────────────────────────────────────────────────
+    int                  imgViewIdx       = 0;
+    Texture2D            imgViewTex       = {};
+    bool                 imgViewTexValid  = false;
+    std::atomic<int>     imgViewRequest{-1};
+    std::atomic<bool>    imgViewStop{false};
+    std::atomic<bool>    imgViewLoading{false};
+    std::mutex           imgViewMtx;
+    cv::Mat              imgViewPending;
+    bool                 imgViewHasNew    = false;
+    std::thread          imgViewThread;
 };
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -171,9 +197,13 @@ static Vector3 toRL(const Eigen::Vector3f& v)   { return {v.x(), v.z(), -v.y()};
 
 // Load all cam0_*.jpg from CAMERA_0 (sibling of session dir) into s.images, resized by s.imgScale.
 static void loadImages(State& s) {
-    s.images.clear();
-    fs::path d(s.sessionBuf);
-    fs::path camDir = d.parent_path() / "CAMERA_0";
+    s.imagesFilenamesInTime.clear();
+    fs::path camDir;
+    if (s.cameraBuf[0]) {
+        camDir = fs::path(s.cameraBuf);
+    } else {
+        camDir = fs::path(s.sessionBuf).parent_path() / "CAMERA_0";
+    }
     if (!fs::is_directory(camDir)) { s.status = "No CAMERA_0 dir found"; return; }
 
     int loaded = 0;
@@ -183,20 +213,11 @@ static void loadImages(State& s) {
         try {
             // filename: cam0_<timestamp_ns>.jpg  → strip prefix (5) and ext (4)
             int64_t ts = std::stoll(n.substr(5, n.size() - 9));
-            cv::Mat img = cv::imread(e.path().string(), cv::IMREAD_COLOR);
-            if (img.empty()) continue;
-            if (s.imgScale != 1.0f) {
-                cv::Mat small;
-                cv::resize(img, small, cv::Size(), s.imgScale, s.imgScale, cv::INTER_AREA);
-                s.images[ts] = std::move(small);
-            } else {
-                s.images[ts] = std::move(img);
-            }
+            s.imagesFilenamesInTime[ts] = e.path().string();
             ++loaded;
         } catch (...) {}
     }
-    s.status = "Images loaded: " + std::to_string(loaded)
-             + " (scale " + std::to_string(s.imgScale) + ")";
+    s.status = "Images loaded: " + std::to_string(loaded) + " from " + camDir.string();
 }
 
 // Parse session_poses.mrp → map from chunk stem (e.g. "scan_lio_0") to Affine3f.
@@ -225,16 +246,17 @@ static void loadSession(State& s) {
     s.traj.poses.clear();
     s.imageTsNs.clear();
     s.exportCloud.clear();
+    s.cloud.unload();
+    loadImages(s);
 
     fs::path d(s.sessionBuf);
     if (!fs::is_directory(d)) { s.status = "Not a directory"; return; }
 
-    // parse MRP if present (session_poses.mrp or session_ini_poses.mri)
+    // parse MRP if present
     auto mrp = parseMRP(d / "session_poses.mrp");
     if (mrp.empty()) mrp = parseMRP(d / "session_ini_poses.mri");
 
     // trajectory CSVs — apply corresponding MRP transform per chunk
-    int csvCount = 0;
     std::vector<fs::path> csvPaths;
     for (auto& e : fs::directory_iterator(d)) {
         std::string n = e.path().filename().string();
@@ -247,12 +269,13 @@ static void loadSession(State& s) {
         std::string idx  = stem.substr(stem.rfind('_') + 1);
         std::string key  = "scan_lio_" + idx;
         const Eigen::Affine3f* M = mrp.count(key) ? &mrp.at(key) : nullptr;
-        if (s.traj.loadCSV(cp.string(), M)) csvCount++;
+        s.traj.loadCSV(cp.string(), M);
     }
     s.traj.sort();
 
-    // camera image timestamps  (CAMERA_0 is sibling of session dir)
-    fs::path camDir = d.parent_path() / "CAMERA_0";
+    // camera image timestamps
+    fs::path camDir = s.cameraBuf[0] ? fs::path(s.cameraBuf)
+                                     : d.parent_path() / "CAMERA_0";
     if (fs::is_directory(camDir)) {
         for (auto& e : fs::directory_iterator(camDir)) {
             std::string n = e.path().filename().string();
@@ -266,7 +289,22 @@ static void loadSession(State& s) {
         std::sort(s.imageTsNs.begin(), s.imageTsNs.end());
     }
 
-    // point cloud: load scan_lio_N.laz, apply MRP, decimate
+    s.status = "Poses: "  + std::to_string(s.traj.poses.size())
+             + "  Img: "  + std::to_string(s.imageTsNs.size())
+             + (mrp.empty() ? "  (no MRP)" : "  +MRP")
+             + "  — press Load cloud";
+}
+
+static void loadCloud(State& s) {
+    s.exportCloud.clear();
+    s.cloud.unload();
+
+    fs::path d(s.sessionBuf);
+    if (!fs::is_directory(d)) { s.status = "No session loaded"; return; }
+
+    auto mrp = parseMRP(d / "session_poses.mrp");
+    if (mrp.empty()) mrp = parseMRP(d / "session_ini_poses.mri");
+
     std::vector<fs::path> lazPaths;
     for (auto& e : fs::directory_iterator(d)) {
         std::string n = e.path().filename().string();
@@ -275,25 +313,22 @@ static void loadSession(State& s) {
     }
     std::sort(lazPaths.begin(), lazPaths.end());
 
-    // prepare coloring: need calibration + at least one image loaded
-    bool canColor = s.calibLoaded && !s.images.empty();
+    bool canColor = s.calibLoaded && !s.imagesFilenamesInTime.empty();
     Eigen::Matrix3f R_wc = canColor ? eulerZYXtoMat3(s.E.rx, s.E.ry, s.E.rz) : Eigen::Matrix3f::Identity();
     Eigen::Vector3f C(s.E.tx, s.E.ty, s.E.tz);
     float K_fx = s.K.fx * s.imgScale, K_fy = s.K.fy * s.imgScale;
     float K_cx = s.K.cx * s.imgScale, K_cy = s.K.cy * s.imgScale;
 
-    auto nearestImgTs = [&](int64_t ts) -> int64_t {
-        auto it = std::lower_bound(s.imageTsNs.begin(), s.imageTsNs.end(), ts);
-        if (it == s.imageTsNs.end()) return s.imageTsNs.back();
-        if (it == s.imageTsNs.begin()) return *it;
-        auto prev = std::prev(it);
-        return (std::abs(*it - ts) < std::abs(*prev - ts)) ? *it : *prev;
-    };
-
     auto packGray = [](float intensity) -> float {
         uint8_t g = (uint8_t)(std::min(1.f, std::max(0.f, intensity)) * 255.f);
         uint32_t p = (uint32_t(g) << 16) | (uint32_t(g) << 8) | uint32_t(g);
         float f; std::memcpy(&f, &p, 4); return f;
+    };
+
+    struct ImgEntry {
+        int64_t         ts;
+        const TrajPose* pose;
+        cv::Mat         img;
     };
 
     std::vector<float> gpuData;
@@ -303,67 +338,127 @@ static void loadSession(State& s) {
     int coloredChunks = 0;
 
     for (auto& lp : lazPaths) {
-        std::string key = lp.stem().string();
-        const Eigen::Affine3f* M = mrp.count(key) ? &mrp.at(key) : nullptr;
+        std::string key = lp.stem().string();   // "scan_lio_N"
         std::string idx = key.substr(key.rfind('_') + 1);
+        const Eigen::Affine3f* M = mrp.count(key) ? &mrp.at(key) : nullptr;
 
-        const TrajPose* imgPose  = nullptr;
-        const cv::Mat*  chunkImg = nullptr;
-        if (canColor && !s.imageTsNs.empty()) {
+        // ── step 1: read chunk time range from the matching trajectory CSV ──
+        int64_t chunkFirst = 0, chunkLast = 0;
+        {
             fs::path csvPath = d / ("trajectory_lio_" + idx + ".csv");
             std::ifstream cf(csvPath);
-            int64_t first = 0, last = 0;
             if (cf) {
                 std::string line; std::getline(cf, line);
                 while (std::getline(cf, line)) {
                     if (line.empty()) continue;
                     std::istringstream ss(line); int64_t ts; ss >> ts;
                     if (!ss) continue;
-                    if (!first) first = ts; last = ts;
+                    if (!chunkFirst) chunkFirst = ts;
+                    chunkLast = ts;
                 }
             }
-            if (first && last) {
-                int64_t imgTs = nearestImgTs((first + last) / 2);
-                auto    imgIt = s.images.find(imgTs);
-                imgPose = s.traj.nearest(imgTs);
-                if (imgIt != s.images.end() && imgPose)
-                    chunkImg = &imgIt->second;
+        }
+
+        // ── step 2: collect images for this chunk ───────────────────────────
+        std::vector<ImgEntry> chunkImgs;
+        if (canColor && chunkFirst && chunkLast) {
+            if (s.multiImgColoring) {
+                // new: every image whose timestamp falls inside the chunk range
+                auto it0 = std::lower_bound(s.imageTsNs.begin(), s.imageTsNs.end(), chunkFirst);
+                auto it1 = std::upper_bound(s.imageTsNs.begin(), s.imageTsNs.end(), chunkLast);
+                for (auto it = it0; it != it1; ++it) {
+                    int64_t imgTs = *it;
+                    auto fnIt = s.imagesFilenamesInTime.find(imgTs);
+                    if (fnIt == s.imagesFilenamesInTime.end()) continue;
+                    const TrajPose* pose = s.traj.nearest(imgTs);
+                    if (!pose) continue;
+                    cv::Mat img = cv::imread(fnIt->second);
+                    if (img.empty()) continue;
+                    chunkImgs.push_back({imgTs, pose, std::move(img)});
+                }
+            } else {
+                // legacy: single image nearest to chunk midpoint
+                int64_t mid = (chunkFirst + chunkLast) / 2;
+                auto it = std::lower_bound(s.imageTsNs.begin(), s.imageTsNs.end(), mid);
+                if (it == s.imageTsNs.end()) --it;
+                else if (it != s.imageTsNs.begin()) {
+                    auto prev = std::prev(it);
+                    if (std::abs(*prev - mid) < std::abs(*it - mid)) it = prev;
+                }
+                int64_t imgTs = *it;
+                auto fnIt = s.imagesFilenamesInTime.find(imgTs);
+                const TrajPose* pose = s.traj.nearest(imgTs);
+                if (fnIt != s.imagesFilenamesInTime.end() && pose) {
+                    cv::Mat img = cv::imread(fnIt->second);
+                    if (!img.empty()) chunkImgs.push_back({imgTs, pose, std::move(img)});
+                }
             }
         }
-        if (chunkImg) ++coloredChunks;
+        if (!chunkImgs.empty()) ++coloredChunks;
 
+        // ── step 3: load point cloud ────────────────────────────────────────
         PointCloud pc;
         if (!pc.load(lp.string())) continue;
 
+        int nImgs = (int)chunkImgs.size();
+
+        // ── step 4: colorize each point ─────────────────────────────────────
+        // chunkImgs is sorted by ts (imageTsNs was sorted)
+        // For each point: find nearest image by pt.ts_ns, expand outward until
+        // the point lands inside a frustum.
         for (int i = 0; i < (int)pc.points.size(); i += step) {
             auto& pt = pc.points[i];
             Eigen::Vector3f pw(pt.x, pt.y, pt.z);
             if (M) pw = *M * pw;
 
-            // world → raylib
             gpuData.push_back(pw.x());
             gpuData.push_back(pw.z());
             gpuData.push_back(-pw.y());
 
-            float colorF = packGray(pt.intensity);
-            if (chunkImg && imgPose) {
-                // world → lidar body
-                Eigen::Vector3f pl = imgPose->T.inverse() * pw;
-                // lidar body → camera: R_wc^T * (p_lidar - C)
-                Eigen::Vector3f pc_ = R_wc.transpose() * (pl - C);
-                if (pc_.z() > 0.05f) {
-                    int iu = (int)std::round(K_fx * (pc_.x() / pc_.z()) + K_cx);
-                    int iv = (int)std::round(K_fy * (pc_.y() / pc_.z()) + K_cy);
-                    if (iu >= 0 && iu < chunkImg->cols && iv >= 0 && iv < chunkImg->rows) {
-                        cv::Vec3b bgr = chunkImg->at<cv::Vec3b>(iv, iu);
-                        uint32_t p = (uint32_t(bgr[2]) << 16) |
-                                     (uint32_t(bgr[1]) <<  8) |
-                                      uint32_t(bgr[0]);
-                        std::memcpy(&colorF, &p, 4);
+            const float rawIntensity = pt.intensity;
+            float colorF = packGray(rawIntensity);
+
+            if (nImgs > 0) {
+                // nearest image by point timestamp
+                int startIdx = 0;
+                if (pt.ts_ns != 0) {
+                    auto it = std::lower_bound(chunkImgs.begin(), chunkImgs.end(), pt.ts_ns,
+                        [](const ImgEntry& e, int64_t t){ return e.ts < t; });
+                    if (it == chunkImgs.end()) --it;
+                    else if (it != chunkImgs.begin()) {
+                        auto prev = std::prev(it);
+                        if (std::abs(prev->ts - pt.ts_ns) < std::abs(it->ts - pt.ts_ns))
+                            it = prev;
+                    }
+                    startIdx = (int)(it - chunkImgs.begin());
+                }
+
+                // try images expanding outward from startIdx; first frustum hit wins
+                auto tryImg = [&](int idx) -> bool {
+                    if (idx < 0 || idx >= nImgs) return false;
+                    auto& e = chunkImgs[idx];
+                    Eigen::Vector3f pl  = e.pose->T.inverse() * pw;
+                    Eigen::Vector3f pc_ = R_wc.transpose() * (pl - C);
+                    if (pc_.z() <= 0.05f) return false;
+                    int iu = (int)std::round(K_fx * pc_.x() / pc_.z() + K_cx);
+                    int iv = (int)std::round(K_fy * pc_.y() / pc_.z() + K_cy);
+                    if (iu < 0 || iu >= e.img.cols || iv < 0 || iv >= e.img.rows) return false;
+                    cv::Vec3b bgr = e.img.at<cv::Vec3b>(iv, iu);
+                    uint32_t p = (uint32_t(bgr[2]) << 16) | (uint32_t(bgr[1]) << 8) | uint32_t(bgr[0]);
+                    std::memcpy(&colorF, &p, 4);
+                    return true;
+                };
+
+                if (!tryImg(startIdx)) {
+                    for (int delta = 1; delta < nImgs; ++delta) {
+                        if (tryImg(startIdx + delta)) break;
+                        if (tryImg(startIdx - delta)) break;
                     }
                 }
             }
+
             gpuData.push_back(colorF);
+            gpuData.push_back(rawIntensity);
 
             uint32_t packed; std::memcpy(&packed, &colorF, 4);
             s.exportCloud.push_back({pw.x(), pw.y(), pw.z(),
@@ -375,6 +470,7 @@ static void loadSession(State& s) {
             if (d2 > mx*mx) mx = std::sqrt(d2);
             sumX += pw.x(); sumY += pw.z(); sumZ += -pw.y(); cnt++;
         }
+        // chunkImgs and their cv::Mat memory are released here
     }
     s.useImageColor = canColor && (coloredChunks > 0);
 
@@ -384,10 +480,9 @@ static void loadSession(State& s) {
         s.orbit.dist   = std::max(5.f, mx * 0.3f);
     }
 
-    s.status = "Poses: "  + std::to_string(s.traj.poses.size())
-             + "  Img: "  + std::to_string(s.imageTsNs.size())
-             + "  Pts: "  + std::to_string(s.cloud.count)
-             + (mrp.empty() ? "  (no MRP)" : "  +MRP")
+    s.status = "Pts: "    + std::to_string(s.cloud.count)
+             + "  Poses: "+ std::to_string(s.traj.poses.size())
+             + "  Imgs/chunk: " + std::to_string(coloredChunks > 0 ? coloredChunks : 0)
              + (s.useImageColor ? "  +RGB" : "");
 }
 
@@ -496,20 +591,38 @@ static void drawScene(State& s) {
         float ncy[4] = {(0.f           - s.K.cy) / s.K.fy, (0.f           - s.K.cy) / s.K.fy,
                         (float(s.imgH) - s.K.cy) / s.K.fy, (float(s.imgH) - s.K.cy) / s.K.fy};
 
+        int64_t hlTs = (!s.imageTsNs.empty() && s.imgViewIdx >= 0 &&
+                        s.imgViewIdx < (int)s.imageTsNs.size())
+                       ? s.imageTsNs[s.imgViewIdx] : -1;
+
         for (int64_t ts : s.imageTsNs) {
             const TrajPose* pose = s.traj.nearest(ts);
             if (!pose) continue;
 
-            // camera origin in world: T_world_lidar * C
             Vector3 origin = toRL(pose->T * C);
 
             Vector3 w[4];
             for (int k = 0; k < 4; k++) {
-                // corner in camera frame → lidar body frame → world
                 Eigen::Vector3f pl = R_wc * Eigen::Vector3f(ncx[k]*fs, ncy[k]*fs, fs) + C;
                 w[k] = toRL(pose->T * pl);
             }
-            Color fc = ORANGE;
+
+            bool hl = (ts == hlTs);
+            Color fc = hl ? Color{255, 255,  50, 255} : ORANGE;
+            float sc = hl ? fs * 1.05f : fs;
+
+            if (hl) {
+                // filled quad highlight
+                Vector3 w2[4];
+                for (int k = 0; k < 4; k++) {
+                    Eigen::Vector3f pl = R_wc * Eigen::Vector3f(ncx[k]*sc, ncy[k]*sc, sc) + C;
+                    w2[k] = toRL(pose->T * pl);
+                }
+                DrawTriangle3D(w2[0], w2[1], w2[2], Color{255,255,50,40});
+                DrawTriangle3D(w2[2], w2[3], w2[0], Color{255,255,50,40});
+                DrawSphere(origin, fs * 0.04f, fc);
+            }
+
             DrawLine3D(origin,w[0],fc); DrawLine3D(origin,w[1],fc);
             DrawLine3D(origin,w[2],fc); DrawLine3D(origin,w[3],fc);
             DrawLine3D(w[0],w[1],fc);   DrawLine3D(w[1],w[2],fc);
@@ -523,10 +636,10 @@ static void drawScene(State& s) {
         Matrix mvp = MatrixMultiply(rlGetMatrixModelview(), rlGetMatrixProjection());
         rlEnableShader(s.shader.id);
         rlSetUniformMatrix(s.locMVP, mvp);
-        rlSetUniform(s.locPS, &s.pointSize,     RL_SHADER_UNIFORM_FLOAT, 1);
-        rlSetUniform(s.locMD, &s.cloud.maxDist, RL_SHADER_UNIFORM_FLOAT, 1);
+        rlSetUniform(s.locPS, &s.pointSize, RL_SHADER_UNIFORM_FLOAT, 1);
         int cm = s.useImageColor ? 1 : 0;
-        rlSetUniform(s.locCM, &cm, RL_SHADER_UNIFORM_INT, 1);
+        rlSetUniform(s.locCM,    &cm,          RL_SHADER_UNIFORM_INT, 1);
+        rlSetUniform(s.locDecim, &s.drawDecim, RL_SHADER_UNIFORM_INT, 1);
         rlEnableVertexArray(s.cloud.vao);
         glDrawArrays(GL_POINTS, 0, s.cloud.count);
         rlDisableVertexArray();
@@ -539,6 +652,7 @@ int main(int argc, char* argv[]) {
     State s;
     if (argc > 1) strncpy(s.sessionBuf, argv[1], sizeof(s.sessionBuf)-1);
     if (argc > 2) strncpy(s.calibBuf,   argv[2], sizeof(s.calibBuf)-1);
+    if (argc > 3) strncpy(s.cameraBuf,  argv[3], sizeof(s.cameraBuf)-1);
 
     SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_MSAA_4X_HINT);
     InitWindow(1400, 900, "Trajectory Viewer");
@@ -548,18 +662,44 @@ int main(int argc, char* argv[]) {
     s.shader   = LoadShaderFromMemory(kVS, kFS);
     s.shaderOk = s.shader.id > 0;
     if (s.shaderOk) {
-        s.locMVP = rlGetLocationUniform(s.shader.id, "mvp");
-        s.locPS  = rlGetLocationUniform(s.shader.id, "pointSize");
-        s.locMD  = rlGetLocationUniform(s.shader.id, "maxDist");
-        s.locCM  = rlGetLocationUniform(s.shader.id, "colorMode");
+        s.locMVP   = rlGetLocationUniform(s.shader.id, "mvp");
+        s.locPS    = rlGetLocationUniform(s.shader.id, "pointSize");
+        s.locCM    = rlGetLocationUniform(s.shader.id, "colorMode");
+        s.locDecim = rlGetLocationUniform(s.shader.id, "drawDecim");
     }
     glEnable(GL_PROGRAM_POINT_SIZE);
+
+    // image viewer background loader thread
+    s.imgViewThread = std::thread([&s]() {
+        int lastLoaded = -1;
+        while (!s.imgViewStop.load()) {
+            int req = s.imgViewRequest.load();
+            if (req != lastLoaded && req >= 0 && req < (int)s.imageTsNs.size()) {
+                lastLoaded = req;
+                s.imgViewLoading = true;
+                int64_t ts = s.imageTsNs[req];
+                auto it = s.imagesFilenamesInTime.find(ts);
+                if (it != s.imagesFilenamesInTime.end()) {
+                    cv::Mat img = cv::imread(it->second);
+                    if (!img.empty()) {
+                        cv::cvtColor(img, img, cv::COLOR_BGR2RGB);
+                        std::lock_guard<std::mutex> lk(s.imgViewMtx);
+                        s.imgViewPending = std::move(img);
+                        s.imgViewHasNew  = true;
+                    }
+                }
+                s.imgViewLoading = false;
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(8));
+            }
+        }
+    });
 
     // auto-load if args given
     if (s.sessionBuf[0]) loadSession(s);
     if (s.calibBuf[0])   loadCalib(s);
 
-    const float PANEL_W = 420.f;
+    float panelW = 420.f;
 
     while (!WindowShouldClose()) {
         bool imguiWants = ImGui::GetIO().WantCaptureMouse;
@@ -578,14 +718,35 @@ int main(int argc, char* argv[]) {
         DrawLine3D({0,0,0},{0,0,-2},BLUE);
         EndMode3D();
 
+        // ── upload image viewer texture if worker produced one ────────────────
+        {
+            cv::Mat toUpload;
+            {
+                std::lock_guard<std::mutex> lk(s.imgViewMtx);
+                if (s.imgViewHasNew) {
+                    std::swap(toUpload, s.imgViewPending);
+                    s.imgViewHasNew = false;
+                }
+            }
+            if (!toUpload.empty()) {
+                if (s.imgViewTexValid) UnloadTexture(s.imgViewTex);
+                Image ri = { toUpload.data, toUpload.cols, toUpload.rows, 1,
+                             PIXELFORMAT_UNCOMPRESSED_R8G8B8 };
+                s.imgViewTex      = LoadTextureFromImage(ri);
+                s.imgViewTexValid = s.imgViewTex.id > 0;
+            }
+        }
+
         // ── ImGui panel ───────────────────────────────────────────────────────
         rlImGuiBegin();
         ImGuiIO& io = ImGui::GetIO();
-        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - PANEL_W, 0), ImGuiCond_Always);
-        ImGui::SetNextWindowSize(ImVec2(PANEL_W, io.DisplaySize.y), ImGuiCond_Always);
+        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - panelW, 0), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(panelW, io.DisplaySize.y), ImGuiCond_Always);
         ImGui::Begin("##panel", nullptr,
-            ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-            ImGuiWindowFlags_NoMove     | ImGuiWindowFlags_NoCollapse);
+            ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove |
+            ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar |
+            ImGuiWindowFlags_NoScrollWithMouse);
+        panelW = ImGui::GetWindowWidth();
 
         ImGui::TextColored(ImVec4(0.4f,0.8f,1.f,1.f), "Trajectory Viewer");
         ImGui::Separator();
@@ -594,19 +755,18 @@ int main(int argc, char* argv[]) {
             ImGui::PushItemWidth(-1);
             ImGui::Text("LIO result directory:");
             ImGui::InputText("##sess", s.sessionBuf, sizeof(s.sessionBuf));
-            ImGui::InputInt("Point decimation", &s.cloudDecim);
+            ImGui::Text("CAMERA_0 directory (empty = auto):");
+            ImGui::InputText("##cam", s.cameraBuf, sizeof(s.cameraBuf));
+            if (ImGui::Button("Load session", ImVec2(-1, 0))) loadSession(s);
+            if (!s.imagesFilenamesInTime.empty())
+                ImGui::TextDisabled("%d images found", (int)s.imagesFilenamesInTime.size());
+            ImGui::Separator();
+            ImGui::InputInt("Load decimation", &s.cloudDecim);
             s.cloudDecim = std::max(1, s.cloudDecim);
-            float hw = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
-            if (ImGui::Button("Load session", ImVec2(hw, 0))) loadSession(s);
-            ImGui::SameLine();
-            if (ImGui::Button("Load images", ImVec2(hw, 0))) {
-                loadImages(s);
-                // re-colorize if session already loaded
-                if (!s.traj.poses.empty()) loadSession(s);
-            }
-            ImGui::SliderFloat("Img scale", &s.imgScale, 0.1f, 1.0f, "%.2f");
-            if (!s.images.empty())
-                ImGui::TextDisabled("%d images in RAM", (int)s.images.size());
+            ImGui::Checkbox("Multi-image coloring", &s.multiImgColoring);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("ON: all images per chunk, per-point assignment\nOFF: single image per chunk (midpoint)");
+            if (ImGui::Button("Load cloud", ImVec2(-1, 0))) loadCloud(s);
             ImGui::PopItemWidth();
         }
 
@@ -629,9 +789,32 @@ int main(int argc, char* argv[]) {
             ImGui::Checkbox("Show frustums", &s.showFrustums);
             ImGui::SliderFloat("Frustum scale", &s.frustumScale, 0.05f, 5.f, "%.2f");
             ImGui::SliderFloat("Point size",    &s.pointSize,    1.f,  20.f, "%.1f");
-            if (!s.images.empty()) {
+            ImGui::SliderInt("Draw decimation", &s.drawDecim,    1,    64);
+            if (!s.imagesFilenamesInTime.empty()) {
                 ImGui::Separator();
                 ImGui::Checkbox("Color by image (RGB)", &s.useImageColor);
+            }
+        }
+
+        if (ImGui::CollapsingHeader("Image Preview", ImGuiTreeNodeFlags_DefaultOpen)) {
+            if (s.imageTsNs.empty()) {
+                ImGui::TextDisabled("Load session first");
+            } else {
+                int nImgs = (int)s.imageTsNs.size();
+                ImGui::PushItemWidth(-1);
+                bool moved = ImGui::SliderInt("##imgidx", &s.imgViewIdx, 0, nImgs - 1);
+                ImGui::PopItemWidth();
+                ImGui::SameLine(0, 4);
+                ImGui::TextDisabled("%d/%d", s.imgViewIdx + 1, nImgs);
+                if (moved) {
+                    s.imgViewIdx = std::clamp(s.imgViewIdx, 0, nImgs - 1);
+                    s.imgViewRequest.store(s.imgViewIdx);
+                }
+                ImGui::TextDisabled("ts: %lld", (long long)s.imageTsNs[s.imgViewIdx]);
+                if (s.imgViewLoading.load())
+                    ImGui::TextColored(ImVec4(1,1,0,1), "Loading...");
+                else if (s.imgViewTexValid)
+                    ImGui::TextColored(ImVec4(0,1,0,1), "%dx%d", s.imgViewTex.width, s.imgViewTex.height);
             }
         }
 
@@ -654,9 +837,28 @@ int main(int argc, char* argv[]) {
         ImGui::TextDisabled("LMB: orbit  RMB: pan  Scroll: zoom");
 
         ImGui::End();
+
+        // ── floating image viewer window ──────────────────────────────────────
+        if (s.imgViewTexValid) {
+            ImGui::SetNextWindowPos(ImVec2(8, 8), ImGuiCond_Once);
+            ImGui::SetNextWindowSize(ImVec2(640, 480), ImGuiCond_Once);
+            ImGui::Begin("Image##viewer", nullptr, ImGuiWindowFlags_NoScrollbar);
+            ImVec2 avail = ImGui::GetContentRegionAvail();
+            float aspect = (float)s.imgViewTex.height / (float)s.imgViewTex.width;
+            int dispW = (int)avail.x;
+            int dispH = (int)(avail.x * aspect);
+            if (dispH > (int)avail.y) { dispH = (int)avail.y; dispW = (int)(avail.y / aspect); }
+            rlImGuiImageSize(&s.imgViewTex, dispW, dispH);
+            ImGui::End();
+        }
+
         rlImGuiEnd();
         EndDrawing();
     }
+
+    s.imgViewStop = true;
+    s.imgViewThread.join();
+    if (s.imgViewTexValid) UnloadTexture(s.imgViewTex);
 
     s.cloud.unload();
     if (s.shaderOk) UnloadShader(s.shader);
