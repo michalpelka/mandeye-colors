@@ -63,6 +63,9 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(nlohmann_json)
 
+# ── Eigen ────────────────────────────────────────────────────────────────────
+find_package(Eigen3 3.4 REQUIRED NO_MODULE)
+
 # ── liblaszip (system) ───────────────────────────────────────────────────────
 message("LASzip library")
 add_subdirectory(3rdparty/LASzip)
@@ -93,6 +96,7 @@ target_link_libraries(CalibrationApp PRIVATE
     imgui
     rlimgui
     nlohmann_json::nlohmann_json
+    Eigen3::Eigen
     laszip
     ${OpenCV_LIBS}
 )
@@ -108,11 +112,11 @@ add_executable(TrajectoryViewer
 )
 target_include_directories(TrajectoryViewer PRIVATE src ${LASZIP_INCLUDE})
 target_link_libraries(TrajectoryViewer PRIVATE
-    raylib imgui rlimgui nlohmann_json::nlohmann_json laszip ${OpenCV_LIBS})
+    raylib imgui rlimgui nlohmann_json::nlohmann_json Eigen3::Eigen laszip ${OpenCV_LIBS})
 target_compile_options(TrajectoryViewer PRIVATE -Wall -Wextra)
 
 # ── IntrinsicsCalib ───────────────────────────────────────────────────────────
 add_executable(IntrinsicsCalib src/IntrinsicsCalib.cpp)
 target_link_libraries(IntrinsicsCalib PRIVATE
-    raylib imgui rlimgui nlohmann_json::nlohmann_json ${OpenCV_LIBS})
+    raylib imgui rlimgui nlohmann_json::nlohmann_json Eigen3::Eigen ${OpenCV_LIBS})
 target_compile_options(IntrinsicsCalib PRIVATE -Wall -Wextra)

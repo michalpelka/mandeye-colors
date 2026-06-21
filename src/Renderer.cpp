@@ -71,16 +71,14 @@ void OrbitCamera::update(bool active) {
 // World-frame convention: E.rx/ry/rz = camera orientation in world (R_wc, ZYX Euler).
 // E.tx/ty/tz = camera position in world.  p_cam = R_wc^T * (p_lidar - C).
 static Matrix buildLidarToCamMatrix(const Extrinsics& E) {
-    Mat3 R = eulerZYXtoMat3(E.rx, E.ry, E.rz);
-    // t_internal = -R_wc^T * C
-    float tix = -(R.m[0]*E.tx + R.m[3]*E.ty + R.m[6]*E.tz);
-    float tiy = -(R.m[1]*E.tx + R.m[4]*E.ty + R.m[7]*E.tz);
-    float tiz = -(R.m[2]*E.tx + R.m[5]*E.ty + R.m[8]*E.tz);
-    // Column-major raylib Matrix (rows of R^T become columns of GLSL mat4)
+    Eigen::Matrix3f R = eulerZYXtoMat3(E.rx, E.ry, E.rz);
+    Eigen::Vector3f ti = -(R.transpose() * Eigen::Vector3f(E.tx, E.ty, E.tz));
+    // Raylib Matrix struct fields: m0,m4,m8,m12 / m1,m5,m9,m13 / m2,m6,m10,m14 / m3,m7,m11,m15
+    // We store R^T with translation ti (lidar→cam transform).
     return Matrix{
-        R.m[0], R.m[3], R.m[6], tix,
-        R.m[1], R.m[4], R.m[7], tiy,
-        R.m[2], R.m[5], R.m[8], tiz,
+        R(0,0), R(1,0), R(2,0), ti(0),
+        R(0,1), R(1,1), R(2,1), ti(1),
+        R(0,2), R(1,2), R(2,2), ti(2),
         0.f,    0.f,    0.f,    1.f
     };
 }
@@ -429,7 +427,7 @@ void Renderer::draw3DCloud(const PointCloud& cloud, const VisualizationParams& v
 void Renderer::drawCameraFrustum(const Intrinsics& K, const Extrinsics& E,
                                  int imgW, int imgH, float scale) {
     // World-frame convention: R_wc = camera orientation in world, C = camera position in world
-    Mat3 R = eulerZYXtoMat3(E.rx, E.ry, E.rz);
+    Eigen::Matrix3f R = eulerZYXtoMat3(E.rx, E.ry, E.rz);
 
     // Camera position in LiDAR frame is directly (E.tx, E.ty, E.tz)
     Vector3 origin = {E.tx, E.tz, -E.ty}; // LiDAR→raylib
@@ -443,11 +441,10 @@ void Renderer::drawCameraFrustum(const Intrinsics& K, const Extrinsics& E,
     };
 
     // Transform corners: p_lidar = R_wc * pc_cam + C
+    Eigen::Vector3f C(E.tx, E.ty, E.tz);
     auto toWorld = [&](float xn, float yn) -> Vector3 {
-        Vec3 pc = {xn * scale, yn * scale, scale};
-        Vec3 pl = R.mul(pc);  // R_wc * pc_cam
-        pl.x += E.tx; pl.y += E.ty; pl.z += E.tz;
-        return {pl.x, pl.z, -pl.y}; // LiDAR→raylib
+        Eigen::Vector3f pl = R * Eigen::Vector3f(xn * scale, yn * scale, scale) + C;
+        return {pl.x(), pl.z(), -pl.y()};
     };
     Vector3 w[4];
     for (int i = 0; i < 4; i++)

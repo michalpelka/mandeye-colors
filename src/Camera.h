@@ -1,21 +1,6 @@
 #pragma once
-#include <cmath>
-
-struct Vec3 {
-    float x = 0.f, y = 0.f, z = 0.f;
-};
-
-// Row-major 3x3: element at row r, col c → m[r*3+c]
-struct Mat3 {
-    float m[9] = {};
-    Vec3 mul(Vec3 v) const {
-        return {
-            m[0]*v.x + m[1]*v.y + m[2]*v.z,
-            m[3]*v.x + m[4]*v.y + m[5]*v.z,
-            m[6]*v.x + m[7]*v.y + m[8]*v.z
-        };
-    }
-};
+#include <Eigen/Core>
+#include <Eigen/Geometry>
 
 struct Intrinsics {
     float fx = 800.f, fy = 800.f;
@@ -36,13 +21,15 @@ struct Extrinsics {
     float rx = -90.f, ry = 0.f, rz = -90.f;
 };
 
-// Rotation matrix from ZYX Euler angles (degrees): R = Rz * Ry * Rx.
-// In world-frame convention this gives R_wc (camera orientation in world).
-Mat3 eulerZYXtoMat3(float rx_deg, float ry_deg, float rz_deg);
+// R = Rz * Ry * Rx  (ZYX Euler, degrees → rotation matrix)
+Eigen::Matrix3f eulerZYXtoMat3(float rx_deg, float ry_deg, float rz_deg);
 
 // Project a point from LiDAR frame to image pixel (u, v).
+// R_wc = camera orientation in world, t = camera position in world.
 // depth = z component in camera frame (positive = in front).
 // Returns false if depth <= 0 (behind camera).
 bool projectPoint(float px, float py, float pz,
-                  const Intrinsics& K, const Mat3& R, const Vec3& t,
+                  const Intrinsics& K,
+                  const Eigen::Matrix3f& R_wc,
+                  const Eigen::Vector3f& t,
                   float& u, float& v, float& depth);

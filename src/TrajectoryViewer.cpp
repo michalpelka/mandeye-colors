@@ -167,20 +167,7 @@ struct State {
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 static Vector3 toRL(float x, float y, float z) { return {x, z, -y}; }
-
-static Vector3 applyPose(const float m[12], float px, float py, float pz) {
-    return toRL(m[0]*px + m[1]*py + m[2]*pz + m[3],
-                m[4]*px + m[5]*py + m[6]*pz + m[7],
-                m[8]*px + m[9]*py + m[10]*pz + m[11]);
-}
-
-// rotate-only (no translation)
-static void applyRot3(const float m[12], float px, float py, float pz,
-                      float& ox, float& oy, float& oz) {
-    ox = m[0]*px + m[1]*py + m[2]*pz;
-    oy = m[4]*px + m[5]*py + m[6]*pz;
-    oz = m[8]*px + m[9]*py + m[10]*pz;
-}
+static Vector3 toRL(const Eigen::Vector3f& v)   { return {v.x(), v.z(), -v.y()}; }
 
 // Load all cam0_*.jpg from CAMERA_0 (sibling of session dir) into s.images, resized by s.imgScale.
 static void loadImages(State& s) {
@@ -212,20 +199,24 @@ static void loadImages(State& s) {
              + " (scale " + std::to_string(s.imgScale) + ")";
 }
 
-// Parse session_poses.mrp → map from chunk stem (e.g. "scan_lio_0") to 4×4 row-major matrix.
-static std::map<std::string, std::array<float,16>> parseMRP(const fs::path& mrpPath) {
-    std::map<std::string, std::array<float,16>> result;
+// Parse session_poses.mrp → map from chunk stem (e.g. "scan_lio_0") to Affine3f.
+static std::map<std::string, Eigen::Affine3f> parseMRP(const fs::path& mrpPath) {
+    std::map<std::string, Eigen::Affine3f> result;
     std::ifstream f(mrpPath);
     if (!f) return result;
     int n; f >> n;
     for (int i = 0; i < n; i++) {
         std::string name; f >> name;
-        // strip extension → stem key
         auto dot = name.rfind('.');
         std::string key = (dot != std::string::npos) ? name.substr(0, dot) : name;
-        std::array<float,16> M{};
-        for (int r = 0; r < 16; r++) f >> M[r];
-        if (f) result[key] = M;
+        float raw[16];
+        for (int r = 0; r < 16; r++) f >> raw[r];
+        if (!f) continue;
+        Eigen::Matrix4f M4;
+        for (int r = 0; r < 4; r++)
+            for (int c = 0; c < 4; c++)
+                M4(r, c) = raw[r * 4 + c];
+        result[key] = Eigen::Affine3f(M4);
     }
     return result;
 }
@@ -252,11 +243,10 @@ static void loadSession(State& s) {
     }
     std::sort(csvPaths.begin(), csvPaths.end());
     for (auto& cp : csvPaths) {
-        // trajectory_lio_N.csv  ↔  scan_lio_N.laz  (same index N)
-        std::string stem = cp.stem().string(); // "trajectory_lio_N"
-        std::string idx  = stem.substr(stem.rfind('_') + 1); // "N"
+        std::string stem = cp.stem().string();
+        std::string idx  = stem.substr(stem.rfind('_') + 1);
         std::string key  = "scan_lio_" + idx;
-        const float* M   = mrp.count(key) ? mrp.at(key).data() : nullptr;
+        const Eigen::Affine3f* M = mrp.count(key) ? &mrp.at(key) : nullptr;
         if (s.traj.loadCSV(cp.string(), M)) csvCount++;
     }
     s.traj.sort();
@@ -287,12 +277,11 @@ static void loadSession(State& s) {
 
     // prepare coloring: need calibration + at least one image loaded
     bool canColor = s.calibLoaded && !s.images.empty();
-    Mat3 R_wc = canColor ? eulerZYXtoMat3(s.E.rx, s.E.ry, s.E.rz) : Mat3{};
+    Eigen::Matrix3f R_wc = canColor ? eulerZYXtoMat3(s.E.rx, s.E.ry, s.E.rz) : Eigen::Matrix3f::Identity();
+    Eigen::Vector3f C(s.E.tx, s.E.ty, s.E.tz);
     float K_fx = s.K.fx * s.imgScale, K_fy = s.K.fy * s.imgScale;
     float K_cx = s.K.cx * s.imgScale, K_cy = s.K.cy * s.imgScale;
-    float C_x = s.E.tx, C_y = s.E.ty, C_z = s.E.tz;
 
-    // binary search for nearest image timestamp
     auto nearestImgTs = [&](int64_t ts) -> int64_t {
         auto it = std::lower_bound(s.imageTsNs.begin(), s.imageTsNs.end(), ts);
         if (it == s.imageTsNs.end()) return s.imageTsNs.back();
@@ -301,7 +290,6 @@ static void loadSession(State& s) {
         return (std::abs(*it - ts) < std::abs(*prev - ts)) ? *it : *prev;
     };
 
-    // pack gray intensity (0-1) as 0x00GGGGGG (same value in all channels)
     auto packGray = [](float intensity) -> float {
         uint8_t g = (uint8_t)(std::min(1.f, std::max(0.f, intensity)) * 255.f);
         uint32_t p = (uint32_t(g) << 16) | (uint32_t(g) << 8) | uint32_t(g);
@@ -315,20 +303,18 @@ static void loadSession(State& s) {
     int coloredChunks = 0;
 
     for (auto& lp : lazPaths) {
-        std::string key = lp.stem().string(); // "scan_lio_N"
-        const float* M  = mrp.count(key) ? mrp.at(key).data() : nullptr;
-        std::string idx = key.substr(key.rfind('_') + 1); // "N"
+        std::string key = lp.stem().string();
+        const Eigen::Affine3f* M = mrp.count(key) ? &mrp.at(key) : nullptr;
+        std::string idx = key.substr(key.rfind('_') + 1);
 
-        // find the camera image nearest to the middle of this chunk's trajectory
-        const TrajPose* imgPose = nullptr;
+        const TrajPose* imgPose  = nullptr;
         const cv::Mat*  chunkImg = nullptr;
         if (canColor && !s.imageTsNs.empty()) {
-            // quick read of CSV to get first+last timestamp
             fs::path csvPath = d / ("trajectory_lio_" + idx + ".csv");
             std::ifstream cf(csvPath);
             int64_t first = 0, last = 0;
             if (cf) {
-                std::string line; std::getline(cf, line); // header
+                std::string line; std::getline(cf, line);
                 while (std::getline(cf, line)) {
                     if (line.empty()) continue;
                     std::istringstream ss(line); int64_t ts; ss >> ts;
@@ -337,9 +323,8 @@ static void loadSession(State& s) {
                 }
             }
             if (first && last) {
-                int64_t midTs  = (first + last) / 2;
-                int64_t imgTs  = nearestImgTs(midTs);
-                auto    imgIt  = s.images.find(imgTs);
+                int64_t imgTs = nearestImgTs((first + last) / 2);
+                auto    imgIt = s.images.find(imgTs);
                 imgPose = s.traj.nearest(imgTs);
                 if (imgIt != s.images.end() && imgPose)
                     chunkImg = &imgIt->second;
@@ -352,35 +337,23 @@ static void loadSession(State& s) {
 
         for (int i = 0; i < (int)pc.points.size(); i += step) {
             auto& pt = pc.points[i];
-            float x = pt.x, y = pt.y, z = pt.z;
-            if (M) {
-                float nx = M[0]*x + M[1]*y + M[2]*z  + M[3];
-                float ny = M[4]*x + M[5]*y + M[6]*z  + M[7];
-                float nz = M[8]*x + M[9]*y + M[10]*z + M[11];
-                x = nx; y = ny; z = nz;
-            }
-            // world coords → raylib
-            gpuData.push_back(x);
-            gpuData.push_back(z);
-            gpuData.push_back(-y);
+            Eigen::Vector3f pw(pt.x, pt.y, pt.z);
+            if (M) pw = *M * pw;
 
-            // color: try to project world point into chunk's camera image
+            // world → raylib
+            gpuData.push_back(pw.x());
+            gpuData.push_back(pw.z());
+            gpuData.push_back(-pw.y());
+
             float colorF = packGray(pt.intensity);
             if (chunkImg && imgPose) {
-                const float* m = imgPose->m;
-                // world → lidar body: p_lidar = R_wl^T * (p_world - t)
-                float dx = x - m[3], dy_= y - m[7], dz = z - m[11];
-                float lx = m[0]*dx + m[4]*dy_ + m[8]*dz;
-                float ly = m[1]*dx + m[5]*dy_ + m[9]*dz;
-                float lz = m[2]*dx + m[6]*dy_ + m[10]*dz;
+                // world → lidar body
+                Eigen::Vector3f pl = imgPose->T.inverse() * pw;
                 // lidar body → camera: R_wc^T * (p_lidar - C)
-                float ex = lx - C_x, ey = ly - C_y, ez = lz - C_z;
-                float cx_ = R_wc.m[0]*ex + R_wc.m[3]*ey + R_wc.m[6]*ez;
-                float cy_ = R_wc.m[1]*ex + R_wc.m[4]*ey + R_wc.m[7]*ez;
-                float cz_ = R_wc.m[2]*ex + R_wc.m[5]*ey + R_wc.m[8]*ez;
-                if (cz_ > 0.05f) {
-                    int iu = (int)std::round(K_fx * (cx_/cz_) + K_cx);
-                    int iv = (int)std::round(K_fy * (cy_/cz_) + K_cy);
+                Eigen::Vector3f pc_ = R_wc.transpose() * (pl - C);
+                if (pc_.z() > 0.05f) {
+                    int iu = (int)std::round(K_fx * (pc_.x() / pc_.z()) + K_cx);
+                    int iv = (int)std::round(K_fy * (pc_.y() / pc_.z()) + K_cy);
                     if (iu >= 0 && iu < chunkImg->cols && iv >= 0 && iv < chunkImg->rows) {
                         cv::Vec3b bgr = chunkImg->at<cv::Vec3b>(iv, iu);
                         uint32_t p = (uint32_t(bgr[2]) << 16) |
@@ -393,14 +366,14 @@ static void loadSession(State& s) {
             gpuData.push_back(colorF);
 
             uint32_t packed; std::memcpy(&packed, &colorF, 4);
-            s.exportCloud.push_back({x, y, z,
+            s.exportCloud.push_back({pw.x(), pw.y(), pw.z(),
                 (uint8_t)((packed >> 16) & 0xFF),
                 (uint8_t)((packed >>  8) & 0xFF),
                 (uint8_t)( packed        & 0xFF)});
 
-            float d2 = x*x + y*y + z*z;
+            float d2 = pw.squaredNorm();
             if (d2 > mx*mx) mx = std::sqrt(d2);
-            sumX += x; sumY += z; sumZ += -y; cnt++;
+            sumX += pw.x(); sumY += pw.z(); sumZ += -pw.y(); cnt++;
         }
     }
     s.useImageColor = canColor && (coloredChunks > 0);
@@ -503,49 +476,38 @@ static void exportLAZ(State& s) {
 }
 
 static void drawScene(State& s) {
-    auto toRL = [](float x, float y, float z) -> Vector3 { return {x, z, -y}; };
-
     // ── trajectory path ───────────────────────────────────────────────────────
     if (s.showPath) {
         for (size_t i = 1; i < s.traj.poses.size(); i++) {
             auto& a = s.traj.poses[i-1]; auto& b = s.traj.poses[i];
-            DrawLine3D(toRL(a.m[3], a.m[7], a.m[11]),
-                       toRL(b.m[3], b.m[7], b.m[11]),
+            DrawLine3D(toRL(a.T.translation()),
+                       toRL(b.T.translation()),
                        Color{100, 200, 255, 220});
         }
     }
 
     // ── camera frustums ───────────────────────────────────────────────────────
     if (s.showFrustums && s.calibLoaded) {
-        Mat3 R_wc = eulerZYXtoMat3(s.E.rx, s.E.ry, s.E.rz);
-        Vec3 C    = {s.E.tx, s.E.ty, s.E.tz};
+        Eigen::Matrix3f R_wc = eulerZYXtoMat3(s.E.rx, s.E.ry, s.E.rz);
+        Eigen::Vector3f C(s.E.tx, s.E.ty, s.E.tz);
         float fs  = s.frustumScale;
-        float ncx[4] = {(0.f        - s.K.cx)/s.K.fx, (float(s.imgW)-s.K.cx)/s.K.fx,
-                        (float(s.imgW)-s.K.cx)/s.K.fx, (0.f        - s.K.cx)/s.K.fx};
-        float ncy[4] = {(0.f        - s.K.cy)/s.K.fy, (0.f        - s.K.cy)/s.K.fy,
-                        (float(s.imgH)-s.K.cy)/s.K.fy, (float(s.imgH)-s.K.cy)/s.K.fy};
+        float ncx[4] = {(0.f           - s.K.cx) / s.K.fx, (float(s.imgW) - s.K.cx) / s.K.fx,
+                        (float(s.imgW) - s.K.cx) / s.K.fx, (0.f           - s.K.cx) / s.K.fx};
+        float ncy[4] = {(0.f           - s.K.cy) / s.K.fy, (0.f           - s.K.cy) / s.K.fy,
+                        (float(s.imgH) - s.K.cy) / s.K.fy, (float(s.imgH) - s.K.cy) / s.K.fy};
 
         for (int64_t ts : s.imageTsNs) {
             const TrajPose* pose = s.traj.nearest(ts);
             if (!pose) continue;
 
-            // camera origin in world
-            Vec3 camW;
-            { float ox, oy, oz;
-              applyRot3(pose->m, C.x, C.y, C.z, ox, oy, oz);
-              camW = {ox + pose->m[3], oy + pose->m[7], oz + pose->m[11]}; }
-            Vector3 origin = toRL(camW.x, camW.y, camW.z);
+            // camera origin in world: T_world_lidar * C
+            Vector3 origin = toRL(pose->T * C);
 
             Vector3 w[4];
             for (int k = 0; k < 4; k++) {
-                // p_cam → p_lidar (body) via R_wc
-                Vec3 pc = {ncx[k]*fs, ncy[k]*fs, fs};
-                Vec3 pl = R_wc.mul(pc);
-                pl.x += C.x; pl.y += C.y; pl.z += C.z;
-                // p_lidar → world via trajectory pose
-                float ox, oy, oz;
-                applyRot3(pose->m, pl.x, pl.y, pl.z, ox, oy, oz);
-                w[k] = toRL(ox + pose->m[3], oy + pose->m[7], oz + pose->m[11]);
+                // corner in camera frame → lidar body frame → world
+                Eigen::Vector3f pl = R_wc * Eigen::Vector3f(ncx[k]*fs, ncy[k]*fs, fs) + C;
+                w[k] = toRL(pose->T * pl);
             }
             Color fc = ORANGE;
             DrawLine3D(origin,w[0],fc); DrawLine3D(origin,w[1],fc);

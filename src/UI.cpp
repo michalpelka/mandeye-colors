@@ -245,10 +245,10 @@ void UI::panelExtrinsics(AppState& state) {
 
     // Show current rotation matrix
     if (ImGui::TreeNode("Rotation matrix")) {
-        Mat3 R = eulerZYXtoMat3(E.rx, E.ry, E.rz);
+        Eigen::Matrix3f R = eulerZYXtoMat3(E.rx, E.ry, E.rz);
         for (int r = 0; r < 3; r++) {
             ImGui::Text("[ %6.3f  %6.3f  %6.3f ]",
-                R.m[r*3+0], R.m[r*3+1], R.m[r*3+2]);
+                R(r,0), R(r,1), R(r,2));
         }
         ImGui::TreePop();
     }

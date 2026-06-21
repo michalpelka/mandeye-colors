@@ -321,11 +321,9 @@ void AppState::loadCalibration(const char* path) {
 void AppState::saveCalibration(const char* path) {
     // World-frame convention: R = R_wc (camera orientation in world, ZYX Euler)
     // C = camera position in world.  T_lidar_to_cam = [R_wc^T | -R_wc^T*C]
-    Mat3 R = eulerZYXtoMat3(extrinsics.rx, extrinsics.ry, extrinsics.rz);
-    float cx = extrinsics.tx, cy = extrinsics.ty, cz = extrinsics.tz;
-    float tix = -(R.m[0]*cx + R.m[3]*cy + R.m[6]*cz);
-    float tiy = -(R.m[1]*cx + R.m[4]*cy + R.m[7]*cz);
-    float tiz = -(R.m[2]*cx + R.m[5]*cy + R.m[8]*cz);
+    Eigen::Matrix3f R  = eulerZYXtoMat3(extrinsics.rx, extrinsics.ry, extrinsics.rz);
+    Eigen::Vector3f C(extrinsics.tx, extrinsics.ty, extrinsics.tz);
+    Eigen::Vector3f ti = -(R.transpose() * C);  // translation of T_lidar_to_camera
 
     nlohmann::json j;
     j["intrinsics"] = {
@@ -335,18 +333,17 @@ void AppState::saveCalibration(const char* path) {
         {"k4", intrinsics.k4}, {"k5", intrinsics.k5}, {"k6", intrinsics.k6},
         {"p1", intrinsics.p1}, {"p2", intrinsics.p2}
     };
-    // camera_rotation_in_world: R_wc describes camera body axes in LiDAR/world frame
     j["extrinsics"]["camera_rotation_in_world_euler_zyx_deg"] = {extrinsics.rz, extrinsics.ry, extrinsics.rx};
-    j["extrinsics"]["camera_position_in_world_xyz"] = {cx, cy, cz};
+    j["extrinsics"]["camera_position_in_world_xyz"] = {C.x(), C.y(), C.z()};
     j["extrinsics"]["camera_rotation_matrix_in_world"] = {
-        {R.m[0], R.m[1], R.m[2]},
-        {R.m[3], R.m[4], R.m[5]},
-        {R.m[6], R.m[7], R.m[8]}
+        {R(0,0), R(0,1), R(0,2)},
+        {R(1,0), R(1,1), R(1,2)},
+        {R(2,0), R(2,1), R(2,2)}
     };
     j["extrinsics"]["T_lidar_to_camera_4x4"] = {
-        {R.m[0], R.m[3], R.m[6], tix},
-        {R.m[1], R.m[4], R.m[7], tiy},
-        {R.m[2], R.m[5], R.m[8], tiz},
+        {R(0,0), R(1,0), R(2,0), ti(0)},
+        {R(0,1), R(1,1), R(2,1), ti(1)},
+        {R(0,2), R(1,2), R(2,2), ti(2)},
         {0, 0, 0, 1}
     };
 
