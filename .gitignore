@@ -1,0 +1,29 @@
+# Build directories
+build/
+cmake-build-*/
+out/
+
+# CMake FetchContent / ExternalProject cache
+_deps/
+
+# Compiled objects / libraries / binaries
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.exe
+
+# imgui per-user layout (not project config)
+imgui.ini
+
+# macOS
+.DS_Store
+
+# Linux/editor swap files
+*.swp
+*.swo
+*~
+
+# CLion local overrides (workspace.xml already excluded via .idea/.gitignore)
+.idea/cmake.xml
