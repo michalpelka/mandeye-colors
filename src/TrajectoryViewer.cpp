@@ -193,7 +193,7 @@ struct State {
     // ── COLMAP export ─────────────────────────────────────────────────────────
     char colmapBuf[512]    = "colmap_out";
     bool colmapCopyImages  = false;
-    int  colmapPtDecim     = 1;
+    int  colmapPtDecim     = 50;  // splat-friendly default (~500k from a 25M cloud)
 
     // ── image viewer ────────────────────────────────────────────────────────
     int                  imgViewIdx       = 0;
@@ -662,6 +662,24 @@ static void exportColmap(State& s) {
         }
     }
 
+    // points3D.ply — binary PLY (xyz + uchar rgb), same decimation. Convenient
+    // init cloud for 3DGS trainers and opens directly in CloudCompare.
+    {
+        int step = std::max(1, s.colmapPtDecim);
+        size_t n = (s.exportCloud.size() + step - 1) / step;
+        std::ofstream f(sparse / "points3D.ply", std::ios::binary);
+        f << "ply\nformat binary_little_endian 1.0\n"
+          << "element vertex " << n << "\n"
+          << "property float x\nproperty float y\nproperty float z\n"
+          << "property uchar red\nproperty uchar green\nproperty uchar blue\n"
+          << "end_header\n";
+        for (size_t i = 0; i < s.exportCloud.size(); i += step) {
+            const auto& p = s.exportCloud[i];
+            f.write(reinterpret_cast<const char*>(&p.x), sizeof(float) * 3);
+            f.write(reinterpret_cast<const char*>(&p.r), 3);  // r,g,b contiguous
+        }
+    }
+
     if (s.colmapCopyImages) {
         fs::path imgd = out / "images";
         fs::create_directories(imgd, ec);
@@ -671,7 +689,7 @@ static void exportColmap(State& s) {
     }
 
     s.status = "COLMAP: " + std::to_string(nImg) + " images, "
-             + std::to_string(nPts) + " points -> " + sparse.string();
+             + std::to_string(nPts) + " points (+ply) -> " + sparse.string();
 }
 
 // Gather everything the ROS exporter needs from current viewer state.
