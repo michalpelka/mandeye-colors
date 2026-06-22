@@ -27,3 +27,8 @@ imgui.ini
 
 # CLion local overrides (workspace.xml already excluded via .idea/.gitignore)
 .idea/cmake.xml
+
+# Visual Studio
+.vs/
+CMakeSettings.json
+3rdpartyBinary/
