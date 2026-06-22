@@ -5,6 +5,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include(FetchContent)
 
+get_filename_component(REPOSITORY_DIRECTORY ${CMAKE_CURRENT_LIST_DIR} ABSOLUTE)
+set(THIRDPARTY_DIRECTORY_BINARY ${REPOSITORY_DIRECTORY}/3rdpartyBinary)
+
 # ── raylib ──────────────────────────────────────────────────────────────────
 set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(BUILD_GAMES    OFF CACHE BOOL "" FORCE)
@@ -64,15 +67,51 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(nlohmann_json)
 
 # ── Eigen ────────────────────────────────────────────────────────────────────
-find_package(Eigen3 3.4 REQUIRED NO_MODULE)
+
+add_subdirectory(3rdparty/eigen)
+set(EIGEN3_INCLUDE_DIR ${REPOSITORY_DIRECTORY}/3rdparty/eigen)
+MESSAGE(STATUS "Using bundled Eigen3 : ${EIGEN3_INCLUDE_DIR}")
 
 # ── liblaszip (system) ───────────────────────────────────────────────────────
 message("LASzip library")
 add_subdirectory(3rdparty/LASzip)
-include_directories(3rdparty/LASzip/include)
+
+file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/LASzip/dll/laszip_api.h 
+     DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/LASzip/include/laszip/)
+file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/LASzip/include/laszip/laszip_common.h
+     ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/LASzip/dll/laszip_api.c
+     DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/LASzip/include/laszip/)
+
+set(LASZIP_INCLUDE 
+    ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/LASzip/include 
+    ${CMAKE_CURRENT_BINARY_DIR}/_deps)
+include_directories(${LASZIP_INCLUDE})
+
+# Collect LASzip DLLs on Windows
+if(WIN32)
+    set(LASZIP_DLLS
+        $<TARGET_FILE:laszip3>
+    )
+endif()
 
 # ── OpenCV (system) ──────────────────────────────────────────────────────────
-find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs calib3d)
+
+# Download or Search for OpenCV
+
+include(${THIRDPARTY_DIRECTORY_BINARY}/OpenCV/CMakeLists.txt)
+find_package(OpenCV REQUIRED)
+MESSAGE(STATUS "OpenCV include dir: ${OpenCV_INCLUDE_DIRS}, OpenCV librarys: ${OpenCV_LIBS}")
+
+# Copy OpenCV DLLs to output directory on Windows
+if(WIN32 AND OpenCV_DIR)
+    file(GLOB OPENCV_DLLS "${OpenCV_DIR}/x64/vc16/bin/*.dll")
+    if(OPENCV_DLLS)
+        message(STATUS "Found OpenCV DLLs: ${OPENCV_DLLS}")
+    else()
+        message(WARNING "No OpenCV DLLs found in ${OpenCV_DIR}/x64/vc16/bin/")
+    endif()
+endif()
+
 
 
 # ── executable ───────────────────────────────────────────────────────────────
@@ -97,11 +136,37 @@ target_link_libraries(CalibrationApp PRIVATE
     rlimgui
     nlohmann_json::nlohmann_json
     Eigen3::Eigen
-    laszip
+    laszip3
     ${OpenCV_LIBS}
 )
 
-target_compile_options(CalibrationApp PRIVATE -Wall -Wextra)
+if(MSVC)
+    target_compile_options(CalibrationApp PRIVATE /W4)
+    target_compile_definitions(CalibrationApp PRIVATE _USE_MATH_DEFINES LASZIP_API_VERSION)
+else()
+    target_compile_options(CalibrationApp PRIVATE -Wall -Wextra)
+    target_compile_definitions(CalibrationApp PRIVATE LASZIP_API_VERSION)
+endif()
+
+# Copy OpenCV DLLs to executable directory on Windows
+if(WIN32 AND OPENCV_DLLS)
+    add_custom_command(TARGET CalibrationApp POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${OPENCV_DLLS}
+        $<TARGET_FILE_DIR:CalibrationApp>
+        COMMENT "Copying OpenCV DLLs to CalibrationApp output directory"
+    )
+endif()
+
+# Copy LASzip DLL to executable directory on Windows
+if(WIN32)
+    add_custom_command(TARGET CalibrationApp POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        $<TARGET_FILE:laszip3>
+        $<TARGET_FILE_DIR:CalibrationApp>
+        COMMENT "Copying LASzip DLL to CalibrationApp output directory"
+    )
+endif()
 
 # ── TrajectoryViewer ─────────────────────────────────────────────────────────
 add_executable(TrajectoryViewer
@@ -113,8 +178,34 @@ add_executable(TrajectoryViewer
 )
 target_include_directories(TrajectoryViewer PRIVATE src ${LASZIP_INCLUDE})
 target_link_libraries(TrajectoryViewer PRIVATE
-    raylib imgui rlimgui nlohmann_json::nlohmann_json Eigen3::Eigen laszip ${OpenCV_LIBS})
-target_compile_options(TrajectoryViewer PRIVATE -Wall -Wextra)
+    raylib imgui rlimgui nlohmann_json::nlohmann_json Eigen3::Eigen laszip3 ${OpenCV_LIBS})
+if(MSVC)
+    target_compile_options(TrajectoryViewer PRIVATE /W4)
+    target_compile_definitions(TrajectoryViewer PRIVATE _USE_MATH_DEFINES LASZIP_API_VERSION)
+else()
+    target_compile_options(TrajectoryViewer PRIVATE -Wall -Wextra)
+    target_compile_definitions(TrajectoryViewer PRIVATE LASZIP_API_VERSION)
+endif()
+
+# Copy OpenCV DLLs to executable directory on Windows
+if(WIN32 AND OPENCV_DLLS)
+    add_custom_command(TARGET TrajectoryViewer POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${OPENCV_DLLS}
+        $<TARGET_FILE_DIR:TrajectoryViewer>
+        COMMENT "Copying OpenCV DLLs to TrajectoryViewer output directory"
+    )
+endif()
+
+# Copy LASzip DLL to executable directory on Windows
+if(WIN32)
+    add_custom_command(TARGET TrajectoryViewer POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        $<TARGET_FILE:laszip3>
+        $<TARGET_FILE_DIR:TrajectoryViewer>
+        COMMENT "Copying LASzip DLL to TrajectoryViewer output directory"
+    )
+endif()
 
 # ── Optional ROS 2 bag export ─────────────────────────────────────────────────
 # OFF by default so the project still builds on machines without ROS. Enable with
@@ -151,4 +242,28 @@ endif()
 add_executable(IntrinsicsCalib src/IntrinsicsCalib.cpp)
 target_link_libraries(IntrinsicsCalib PRIVATE
     raylib imgui rlimgui nlohmann_json::nlohmann_json Eigen3::Eigen ${OpenCV_LIBS})
-target_compile_options(IntrinsicsCalib PRIVATE -Wall -Wextra)
+if(MSVC)
+    target_compile_options(IntrinsicsCalib PRIVATE /W4)
+else()
+    target_compile_options(IntrinsicsCalib PRIVATE -Wall -Wextra)
+endif()
+
+# Copy OpenCV DLLs to executable directory on Windows
+if(WIN32 AND OPENCV_DLLS)
+    add_custom_command(TARGET IntrinsicsCalib POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${OPENCV_DLLS}
+        $<TARGET_FILE_DIR:IntrinsicsCalib>
+        COMMENT "Copying OpenCV DLLs to IntrinsicsCalib output directory"
+    )
+endif()
+
+# Copy LASzip DLL to executable directory on Windows
+if(WIN32)
+    add_custom_command(TARGET IntrinsicsCalib POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        $<TARGET_FILE:laszip3>
+        $<TARGET_FILE_DIR:IntrinsicsCalib>
+        COMMENT "Copying LASzip DLL to IntrinsicsCalib output directory"
+    )
+endif()

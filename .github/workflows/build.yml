@@ -1,0 +1,60 @@
+name: Build
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        submodules: recursive
+    
+    - name: Setup MSVC
+      uses: microsoft/setup-msbuild@v1.1
+    
+    - name: Configure CMake
+      run: |
+        cmake -B build -G "Visual Studio 17 2022" -A x64 `
+          -DCMAKE_BUILD_TYPE=Release
+    
+    - name: Build
+      run: cmake --build build --config Release
+    
+    - name: List build artifacts
+      run: Get-ChildItem -Recurse build\Release\*.exe
+
+  build-linux:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        submodules: recursive
+    
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          cmake \
+          ninja-build \
+          libopencv-dev \
+          libeigen3-dev
+    
+    - name: Configure CMake
+      run: |
+        cmake -B build -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_CXX_STANDARD=17
+    
+    - name: Build
+      run: cmake --build build
+    
+    - name: List build artifacts
+      run: ls -la build/CalibrationApp build/TrajectoryViewer build/IntrinsicsCalib
