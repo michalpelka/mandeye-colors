@@ -7,6 +7,7 @@
 #include "Trajectory.h"
 #include "Camera.h"
 #include "PointCloud.h"
+#include "RosExport.h"
 #include <laszip/laszip_api.h>
 #include <nlohmann/json.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -177,6 +178,16 @@ struct State {
     char  exportBuf[512]  = "colored.laz";
     std::vector<ColorPt> exportCloud;
     std::string status;
+
+    // ── ROS 2 export ──────────────────────────────────────────────────────────
+    char            rosOutBuf[512] = "ros2_export";
+    int             rosStorageIdx  = 0;  // 0 = mcap, 1 = sqlite3
+    RosExportOptions  ros;
+    std::thread       rosThread;
+    std::atomic<bool> rosBusy{false};
+    std::mutex        rosMtx;
+    std::string       rosResult;
+    bool              rosResultReady = false;
 
     // ── image viewer ────────────────────────────────────────────────────────
     int                  imgViewIdx       = 0;
@@ -494,6 +505,11 @@ static void loadCalib(State& s) {
         auto& ji = j["intrinsics"];
         s.K.fx = ji.value("fx", s.K.fx); s.K.fy = ji.value("fy", s.K.fy);
         s.K.cx = ji.value("cx", s.K.cx); s.K.cy = ji.value("cy", s.K.cy);
+        // rational distortion model (used by ROS export to rectify images)
+        s.K.k1 = ji.value("k1", s.K.k1); s.K.k2 = ji.value("k2", s.K.k2);
+        s.K.k3 = ji.value("k3", s.K.k3); s.K.k4 = ji.value("k4", s.K.k4);
+        s.K.k5 = ji.value("k5", s.K.k5); s.K.k6 = ji.value("k6", s.K.k6);
+        s.K.p1 = ji.value("p1", s.K.p1); s.K.p2 = ji.value("p2", s.K.p2);
     }
     if (j.contains("extrinsics")) {
         auto& je = j["extrinsics"];
@@ -568,6 +584,62 @@ static void exportLAZ(State& s) {
     laszip_close_writer(writer);
     laszip_destroy(writer);
     s.status = "Exported " + std::to_string(s.exportCloud.size()) + " pts → " + s.exportBuf;
+}
+
+// Gather everything the ROS exporter needs from current viewer state.
+static void buildRosInput(State& s, RosExportInput& in) {
+    in.traj        = s.traj;
+    in.imageFiles  = s.imagesFilenamesInTime;
+    in.calibLoaded = s.calibLoaded;
+    in.K           = s.K;
+    in.E           = s.E;
+
+    fs::path d(s.sessionBuf);
+    if (!fs::is_directory(d)) return;
+
+    auto mrp = parseMRP(d / "session_poses.mrp");
+    if (mrp.empty()) mrp = parseMRP(d / "session_ini_poses.mri");
+
+    std::vector<fs::path> lazPaths;
+    for (auto& e : fs::directory_iterator(d)) {
+        std::string n = e.path().filename().string();
+        if (n.rfind("scan_lio_", 0) == 0 && e.path().extension() == ".laz")
+            lazPaths.push_back(e.path());
+    }
+    std::sort(lazPaths.begin(), lazPaths.end());
+    for (auto& lp : lazPaths) {
+        RosExportInput::Chunk ch;
+        ch.lazPath = lp.string();
+        std::string key = lp.stem().string();   // "scan_lio_N"
+        if (mrp.count(key)) { ch.M = mrp.at(key); ch.hasM = true; }
+        in.lidarChunks.push_back(std::move(ch));
+    }
+}
+
+static void exportRos(State& s) {
+    if (s.rosBusy.load()) return;
+
+    // Gather the (owning) input on the UI thread, then run the heavy export on a
+    // worker so the window keeps rendering. `in` and `opt` are owned by the thread.
+    RosExportInput in;
+    buildRosInput(s, in);
+    RosExportOptions opt = s.ros;
+    opt.outUri    = s.rosOutBuf;
+    opt.storageId = (s.rosStorageIdx == 1) ? "sqlite3" : "mcap";
+
+    if (s.rosThread.joinable()) s.rosThread.join();
+    s.rosBusy = true;
+    s.status  = "Exporting ROS 2 bag... (see console)";
+    s.rosThread = std::thread([&s, in = std::move(in), opt]() mutable {
+        std::string st;
+        exportRos2Bag(in, opt, st);
+        {
+            std::lock_guard<std::mutex> lk(s.rosMtx);
+            s.rosResult      = std::move(st);
+            s.rosResultReady = true;
+        }
+        s.rosBusy = false;
+    });
 }
 
 static void drawScene(State& s) {
@@ -705,6 +777,15 @@ int main(int argc, char* argv[]) {
         bool imguiWants = ImGui::GetIO().WantCaptureMouse;
         s.orbit.update(!imguiWants);
 
+        // pick up the ROS export result from the worker thread (if any)
+        {
+            std::lock_guard<std::mutex> lk(s.rosMtx);
+            if (s.rosResultReady) {
+                s.status         = s.rosResult;
+                s.rosResultReady = false;
+            }
+        }
+
         BeginDrawing();
         ClearBackground(Color{25, 25, 25, 255});
 
@@ -744,8 +825,7 @@ int main(int argc, char* argv[]) {
         ImGui::SetNextWindowSize(ImVec2(panelW, io.DisplaySize.y), ImGuiCond_Always);
         ImGui::Begin("##panel", nullptr,
             ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove |
-            ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar |
-            ImGuiWindowFlags_NoScrollWithMouse);
+            ImGuiWindowFlags_NoCollapse);
         panelW = ImGui::GetWindowWidth();
 
         ImGui::TextColored(ImVec4(0.4f,0.8f,1.f,1.f), "Trajectory Viewer");
@@ -828,6 +908,51 @@ int main(int argc, char* argv[]) {
             ImGui::PopItemWidth();
         }
 
+        if (ImGui::CollapsingHeader("ROS 2 Export")) {
+#ifdef CALIB_ENABLE_ROS_EXPORT
+            ImGui::PushItemWidth(-1);
+            ImGui::Text("Output bag directory:");
+            ImGui::InputText("##rosout", s.rosOutBuf, sizeof(s.rosOutBuf));
+            ImGui::Combo("Storage", &s.rosStorageIdx, "mcap\0sqlite3\0");
+
+            ImGui::Separator();
+            ImGui::Checkbox("TF + static TF", &s.ros.exportTf);
+            ImGui::Checkbox("Camera", &s.ros.exportCamera);
+            if (s.ros.exportCamera) {
+                ImGui::Indent();
+                ImGui::Checkbox("Compressed (jpeg)", &s.ros.compressCamera);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("ON: CompressedImage (jpeg)\nOFF: raw Image bgr8");
+                ImGui::Checkbox("Undistort (rectify)", &s.ros.undistortCamera);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Rectify to pinhole so RViz overlays line up\n(CameraInfo published with zero distortion).");
+                ImGui::Unindent();
+            }
+            ImGui::Checkbox("LiDAR undistorted (map frame)", &s.ros.exportLidarUndistorted);
+            ImGui::Checkbox("LiDAR raw (sensor frame)",       &s.ros.exportLidarRaw);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Re-projects points into the lidar frame per-point\nusing the trajectory (needs poses loaded).");
+
+            ImGui::Separator();
+            ImGui::InputDouble("Aggregation (s)", &s.ros.aggregationSec, 0.01, 0.1, "%.3f");
+            s.ros.aggregationSec = std::max(0.001, s.ros.aggregationSec);
+            ImGui::InputInt("LiDAR decimation", &s.ros.lidarDecim);
+            s.ros.lidarDecim = std::max(1, s.ros.lidarDecim);
+
+            if (s.rosBusy.load()) {
+                ImGui::BeginDisabled();
+                ImGui::Button("Exporting...", ImVec2(-1, 0));
+                ImGui::EndDisabled();
+            } else if (ImGui::Button("Export ROS 2 bag", ImVec2(-1, 0))) {
+                exportRos(s);
+            }
+            ImGui::PopItemWidth();
+#else
+            ImGui::TextDisabled("Not available in this build");
+            ImGui::TextDisabled("(rebuild with -DCALIB_ENABLE_ROS_EXPORT=ON)");
+#endif
+        }
+
         if (!s.status.empty()) {
             ImGui::Separator();
             ImGui::TextColored(ImVec4(1,1,0,1), "%s", s.status.c_str());
@@ -858,6 +983,7 @@ int main(int argc, char* argv[]) {
 
     s.imgViewStop = true;
     s.imgViewThread.join();
+    if (s.rosThread.joinable()) s.rosThread.join();
     if (s.imgViewTexValid) UnloadTexture(s.imgViewTex);
 
     s.cloud.unload();

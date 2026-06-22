@@ -109,11 +109,43 @@ add_executable(TrajectoryViewer
     src/Trajectory.cpp
     src/Camera.cpp
     src/PointCloud.cpp
+    src/RosExport.cpp
 )
 target_include_directories(TrajectoryViewer PRIVATE src ${LASZIP_INCLUDE})
 target_link_libraries(TrajectoryViewer PRIVATE
     raylib imgui rlimgui nlohmann_json::nlohmann_json Eigen3::Eigen laszip ${OpenCV_LIBS})
 target_compile_options(TrajectoryViewer PRIVATE -Wall -Wextra)
+
+# ── Optional ROS 2 bag export ─────────────────────────────────────────────────
+# OFF by default so the project still builds on machines without ROS. Enable with
+#   cmake -DCALIB_ENABLE_ROS_EXPORT=ON   (source a ROS 2 install first).
+option(CALIB_ENABLE_ROS_EXPORT "Enable ROS 2 bag export in TrajectoryViewer (needs ROS 2)" OFF)
+if(CALIB_ENABLE_ROS_EXPORT)
+    find_package(rclcpp        REQUIRED)
+    find_package(rosbag2_cpp   REQUIRED)
+    find_package(rosbag2_storage REQUIRED)
+    find_package(builtin_interfaces REQUIRED)
+    find_package(std_msgs      REQUIRED)
+    find_package(geometry_msgs REQUIRED)
+    find_package(sensor_msgs   REQUIRED)
+    find_package(tf2_msgs      REQUIRED)
+    # Link the exported targets with the keyword (PRIVATE) form so it matches the
+    # rest of this target's link calls (ament_target_dependencies uses the plain
+    # form, which CMake forbids mixing).
+    target_link_libraries(TrajectoryViewer PRIVATE
+        rclcpp::rclcpp
+        rosbag2_cpp::rosbag2_cpp
+        rosbag2_storage::rosbag2_storage
+        ${builtin_interfaces_TARGETS}
+        ${std_msgs_TARGETS}
+        ${geometry_msgs_TARGETS}
+        ${sensor_msgs_TARGETS}
+        ${tf2_msgs_TARGETS})
+    target_compile_definitions(TrajectoryViewer PRIVATE CALIB_ENABLE_ROS_EXPORT)
+    message(STATUS "ROS 2 bag export: ENABLED")
+else()
+    message(STATUS "ROS 2 bag export: disabled (set -DCALIB_ENABLE_ROS_EXPORT=ON to enable)")
+endif()
 
 # ── IntrinsicsCalib ───────────────────────────────────────────────────────────
 add_executable(IntrinsicsCalib src/IntrinsicsCalib.cpp)
