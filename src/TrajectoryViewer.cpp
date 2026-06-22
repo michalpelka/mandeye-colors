@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <fstream>
 #include <sstream>
+#include <iomanip>
 #include <cstring>
 #include <cstdint>
 #include <cmath>
@@ -188,6 +189,11 @@ struct State {
     std::mutex        rosMtx;
     std::string       rosResult;
     bool              rosResultReady = false;
+
+    // ── COLMAP export ─────────────────────────────────────────────────────────
+    char colmapBuf[512]    = "colmap_out";
+    bool colmapCopyImages  = false;
+    int  colmapPtDecim     = 1;
 
     // ── image viewer ────────────────────────────────────────────────────────
     int                  imgViewIdx       = 0;
@@ -586,6 +592,88 @@ static void exportLAZ(State& s) {
     s.status = "Exported " + std::to_string(s.exportCloud.size()) + " pts → " + s.exportBuf;
 }
 
+// Export a COLMAP sparse text model (cameras/images/points3D) from the current
+// state. Poses are world->camera; the colored cloud becomes points3D.
+static void exportColmap(State& s) {
+    if (!s.calibLoaded) { s.status = "COLMAP: load calibration first"; return; }
+    if (s.imagesFilenamesInTime.empty()) { s.status = "COLMAP: no images"; return; }
+
+    fs::path out(s.colmapBuf);
+    fs::path sparse = out / "sparse";
+    std::error_code ec;
+    fs::create_directories(sparse, ec);
+    if (ec) { s.status = "COLMAP: cannot create " + sparse.string(); return; }
+
+    // T_lidar_camera (camera pose in the LiDAR frame, from the extrinsics)
+    Eigen::Affine3f T_lc = Eigen::Affine3f::Identity();
+    T_lc.linear()      = eulerZYXtoMat3(s.E.rx, s.E.ry, s.E.rz);
+    T_lc.translation() = Eigen::Vector3f(s.E.tx, s.E.ty, s.E.tz);
+
+    // cameras.txt — rational OpenCV model == COLMAP FULL_OPENCV (12 params)
+    {
+        std::ofstream f(sparse / "cameras.txt");
+        f << std::setprecision(12);
+        f << "# Camera list with one line of data per camera:\n"
+             "#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n";
+        f << "1 FULL_OPENCV " << s.imgW << ' ' << s.imgH << ' '
+          << s.K.fx << ' ' << s.K.fy << ' ' << s.K.cx << ' ' << s.K.cy << ' '
+          << s.K.k1 << ' ' << s.K.k2 << ' ' << s.K.p1 << ' ' << s.K.p2 << ' '
+          << s.K.k3 << ' ' << s.K.k4 << ' ' << s.K.k5 << ' ' << s.K.k6 << '\n';
+    }
+
+    // images.txt — one image per camera frame, pose = world->camera
+    int nImg = 0;
+    {
+        std::ofstream f(sparse / "images.txt");
+        f << std::setprecision(12);
+        f << "# Image list with two lines of data per image:\n"
+             "#   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n"
+             "#   POINTS2D[] as (X, Y, POINT3D_ID)\n";
+        int id = 1;
+        for (auto& [ts, path] : s.imagesFilenamesInTime) {
+            const TrajPose* pose = s.traj.nearest(ts);
+            if (!pose) continue;
+            Eigen::Affine3f T_wc = pose->T * T_lc;     // camera in world
+            Eigen::Affine3f T_cw = T_wc.inverse();      // world -> camera
+            Eigen::Quaternionf q(T_cw.linear()); q.normalize();
+            Eigen::Vector3f t = T_cw.translation();
+            std::string name = fs::path(path).filename().string();
+            f << id << ' ' << q.w() << ' ' << q.x() << ' ' << q.y() << ' ' << q.z()
+              << ' ' << t.x() << ' ' << t.y() << ' ' << t.z() << " 1 " << name << '\n';
+            f << '\n';  // empty POINTS2D line (no 2D-3D correspondences)
+            ++id; ++nImg;
+        }
+    }
+
+    // points3D.txt — the colored cloud (no tracks)
+    size_t nPts = 0;
+    {
+        std::ofstream f(sparse / "points3D.txt");
+        f << "# 3D point list with one line of data per point:\n"
+             "#   POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[] as (IMAGE_ID, POINT2D_IDX)\n";
+        f << std::setprecision(9);
+        int step = std::max(1, s.colmapPtDecim);
+        size_t id = 1;
+        for (size_t i = 0; i < s.exportCloud.size(); i += step) {
+            const auto& p = s.exportCloud[i];
+            f << id << ' ' << p.x << ' ' << p.y << ' ' << p.z << ' '
+              << (int)p.r << ' ' << (int)p.g << ' ' << (int)p.b << " 0\n";
+            ++id; ++nPts;
+        }
+    }
+
+    if (s.colmapCopyImages) {
+        fs::path imgd = out / "images";
+        fs::create_directories(imgd, ec);
+        for (auto& [ts, path] : s.imagesFilenamesInTime)
+            fs::copy_file(path, imgd / fs::path(path).filename(),
+                          fs::copy_options::overwrite_existing, ec);
+    }
+
+    s.status = "COLMAP: " + std::to_string(nImg) + " images, "
+             + std::to_string(nPts) + " points -> " + sparse.string();
+}
+
 // Gather everything the ROS exporter needs from current viewer state.
 static void buildRosInput(State& s, RosExportInput& in) {
     in.traj        = s.traj;
@@ -958,6 +1046,21 @@ int main(int argc, char* argv[]) {
             ImGui::TextDisabled("Not available in this build");
             ImGui::TextDisabled("(rebuild with -DCALIB_ENABLE_ROS_EXPORT=ON)");
 #endif
+        }
+
+        if (ImGui::CollapsingHeader("COLMAP Export")) {
+            ImGui::PushItemWidth(-1);
+            ImGui::Text("Output project dir:");
+            ImGui::InputText("##colmapout", s.colmapBuf, sizeof(s.colmapBuf));
+            ImGui::Checkbox("Copy images into project", &s.colmapCopyImages);
+            ImGui::InputInt("Point decimation", &s.colmapPtDecim);
+            s.colmapPtDecim = std::max(1, s.colmapPtDecim);
+            if (ImGui::Button("Export COLMAP model", ImVec2(-1, 0))) exportColmap(s);
+            ImGui::TextDisabled("Writes sparse/{cameras,images,points3D}.txt");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Needs calibration + a loaded cloud (for points3D).\n"
+                                  "Point COLMAP image_path at the images dir.");
+            ImGui::PopItemWidth();
         }
 
         if (!s.status.empty()) {
