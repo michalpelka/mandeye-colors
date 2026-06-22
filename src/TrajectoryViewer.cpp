@@ -786,6 +786,11 @@ int main(int argc, char* argv[]) {
             }
         }
 
+        // Ctrl toggles point coloring: intensity (jet) <-> RGB
+        if (!ImGui::GetIO().WantCaptureKeyboard &&
+            (IsKeyPressed(KEY_LEFT_CONTROL) || IsKeyPressed(KEY_RIGHT_CONTROL)))
+            s.useImageColor = !s.useImageColor;
+
         BeginDrawing();
         ClearBackground(Color{25, 25, 25, 255});
 
@@ -873,6 +878,8 @@ int main(int argc, char* argv[]) {
             if (!s.imagesFilenamesInTime.empty()) {
                 ImGui::Separator();
                 ImGui::Checkbox("Color by image (RGB)", &s.useImageColor);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Ctrl toggles intensity (jet) <-> RGB");
             }
         }
 
