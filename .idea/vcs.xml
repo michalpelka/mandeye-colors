@@ -3,14 +3,21 @@
   <component name="VcsDirectoryMappings">
     <mapping directory="$PROJECT_DIR$" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/3rdparty/LASzip" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/3rdparty/eigen" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/build-ci/_deps/imgui-src" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/build-ci/_deps/nlohmann_json-src" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/build-ci/_deps/raylib-src" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/build-ci/_deps/rlimgui-src" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/build/_deps/imgui-src" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/build/_deps/nlohmann_json-src" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/build/_deps/raylib-src" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/build/_deps/rlimgui-src" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/cmake-build-debug/_deps/imgui-src" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/cmake-build-debug/_deps/nlohmann_json-src" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/cmake-build-debug/_deps/raylib-src" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/cmake-build-debug/_deps/rlimgui-src" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/cmake-build-relwithdebinfo/_deps/imgui-src" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/cmake-build-relwithdebinfo/_deps/nlohmann_json-src" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/cmake-build-relwithdebinfo/_deps/raylib-src" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/cmake-build-relwithdebinfo/_deps/rlimgui-src" vcs="Git" />
   </component>

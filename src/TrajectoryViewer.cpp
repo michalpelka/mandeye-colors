@@ -36,11 +36,13 @@ static const char* kVS = R"(
 layout(location = 0) in vec3  pos;
 layout(location = 1) in float colorPacked;
 layout(location = 2) in float lidarIntensity;
+layout(location = 3) in float colorCameraId;   // global image index that colored this point, or -1
 uniform mat4  mvp;
 uniform float pointSize;
 uniform int   drawDecim;
 out float fragIntensity;
 out vec4 vertColor;
+flat out float fragColorCameraId;
 void main() {
     if (drawDecim > 1 && (gl_VertexID % drawDecim) != 0) {
         gl_Position  = vec4(2.0, 2.0, 2.0, 1.0);
@@ -55,13 +57,16 @@ void main() {
     float b = float( p        & 0xFFu) / 255.0;
     fragIntensity = lidarIntensity;
     vertColor = vec4(r, g, b, 1.0);
+    fragColorCameraId = colorCameraId;
 }
 )";
 static const char* kFS = R"(
 #version 330
 in float fragIntensity;
 in vec4 vertColor;
+flat in float fragColorCameraId;
 uniform int colorMode;
+uniform int selectedCamera;   // -1 = show all, else keep only points from this image
 out vec4 finalColor;
 vec3 jet(float t) {
     t = clamp(t, 0.0, 1.0);
@@ -70,7 +75,20 @@ vec3 jet(float t) {
                       1.5 - abs(4.0*t - 1.0)), 0.0, 1.0);
 }
 void main() {
-    if (colorMode == 1) finalColor = vertColor;
+    if (colorMode == 1)
+    {
+        if (selectedCamera < 0)
+        {
+            finalColor = vertColor;
+        }
+        else
+        {
+            if (selectedCamera == int(fragColorCameraId))
+                finalColor = vertColor;
+            else
+                discard;   // render only points colored from the selected camera
+        }
+    }
     else finalColor = vec4(jet(fragIntensity), 1.0);
 }
 )";
@@ -87,15 +105,17 @@ struct GpuCloud {
         vao = rlLoadVertexArray();
         rlEnableVertexArray(vao);
         vbo = rlLoadVertexBuffer(data.data(), (int)(data.size()*sizeof(float)), false);
-        const int stride = 5 * sizeof(float);
+        const int stride = 6 * sizeof(float);
         rlSetVertexAttribute(0, 3, RL_FLOAT, false, stride, 0);
         rlEnableVertexAttribute(0);
         rlSetVertexAttribute(1, 1, RL_FLOAT, false, stride, 3*sizeof(float));
         rlEnableVertexAttribute(1);
         rlSetVertexAttribute(2, 1, RL_FLOAT, false, stride, 4*sizeof(float));
         rlEnableVertexAttribute(2);
+        rlSetVertexAttribute(3, 1, RL_FLOAT, false, stride, 5*sizeof(float));
+        rlEnableVertexAttribute(3);
         rlDisableVertexArray();
-        count = (int)(data.size() / 5);
+        count = (int)(data.size() / 6);
     }
     void unload() {
         if (vao) { rlUnloadVertexArray(vao); vao = 0; }
@@ -159,13 +179,14 @@ struct State {
     GpuCloud             cloud;
     Shader               shader = {};
     bool                 shaderOk = false;
-    int                  locMVP = -1, locPS = -1, locCM = -1, locDecim = -1;
+    int                  locMVP = -1, locPS = -1, locCM = -1, locDecim = -1, locSel = -1;
 
     Orbit                orbit;
 
     // controls
     bool  showPath      = true;
     bool  showFrustums  = true;
+    bool  isolateCamera = false;   // render only points colored by the selected (preview) image
     float frustumScale  = 0.5f;
     float pointSize     = 2.f;
     int   cloudDecim      = 1;
@@ -346,6 +367,7 @@ static void loadCloud(State& s) {
         int64_t         ts;
         const TrajPose* pose;
         cv::Mat         img;
+        int             globalIdx;  // index into s.imageTsNs (== imgViewIdx / selectedCamera)
     };
 
     std::vector<float> gpuData;
@@ -391,7 +413,8 @@ static void loadCloud(State& s) {
                     if (!pose) continue;
                     cv::Mat img = cv::imread(fnIt->second);
                     if (img.empty()) continue;
-                    chunkImgs.push_back({imgTs, pose, std::move(img)});
+                    int gidx = (int)(it - s.imageTsNs.begin());
+                    chunkImgs.push_back({imgTs, pose, std::move(img), gidx});
                 }
             } else {
                 // legacy: single image nearest to chunk midpoint
@@ -407,7 +430,8 @@ static void loadCloud(State& s) {
                 const TrajPose* pose = s.traj.nearest(imgTs);
                 if (fnIt != s.imagesFilenamesInTime.end() && pose) {
                     cv::Mat img = cv::imread(fnIt->second);
-                    if (!img.empty()) chunkImgs.push_back({imgTs, pose, std::move(img)});
+                    int gidx = (int)(it - s.imageTsNs.begin());
+                    if (!img.empty()) chunkImgs.push_back({imgTs, pose, std::move(img), gidx});
                 }
             }
         }
@@ -434,6 +458,7 @@ static void loadCloud(State& s) {
 
             const float rawIntensity = pt.intensity;
             float colorF = packGray(rawIntensity);
+            float camIdF = -1.f;   // which image colored this point (global index), -1 = none
 
             if (nImgs > 0) {
                 // nearest image by point timestamp
@@ -463,6 +488,7 @@ static void loadCloud(State& s) {
                     cv::Vec3b bgr = e.img.at<cv::Vec3b>(iv, iu);
                     uint32_t p = (uint32_t(bgr[2]) << 16) | (uint32_t(bgr[1]) << 8) | uint32_t(bgr[0]);
                     std::memcpy(&colorF, &p, 4);
+                    camIdF = (float)e.globalIdx;
                     return true;
                 };
 
@@ -476,6 +502,7 @@ static void loadCloud(State& s) {
 
             gpuData.push_back(colorF);
             gpuData.push_back(rawIntensity);
+            gpuData.push_back(camIdF);
 
             uint32_t packed; std::memcpy(&packed, &colorF, 4);
             s.exportCloud.push_back({pw.x(), pw.y(), pw.z(),
@@ -818,6 +845,10 @@ static void drawScene(State& s) {
         int cm = s.useImageColor ? 1 : 0;
         rlSetUniform(s.locCM,    &cm,          RL_SHADER_UNIFORM_INT, 1);
         rlSetUniform(s.locDecim, &s.drawDecim, RL_SHADER_UNIFORM_INT, 1);
+        int sel = (s.isolateCamera && s.useImageColor &&
+                   s.imgViewIdx >= 0 && s.imgViewIdx < (int)s.imageTsNs.size())
+                  ? s.imgViewIdx : -1;
+        rlSetUniform(s.locSel, &sel, RL_SHADER_UNIFORM_INT, 1);
         rlEnableVertexArray(s.cloud.vao);
         glDrawArrays(GL_POINTS, 0, s.cloud.count);
         rlDisableVertexArray();
@@ -844,6 +875,7 @@ int main(int argc, char* argv[]) {
         s.locPS    = rlGetLocationUniform(s.shader.id, "pointSize");
         s.locCM    = rlGetLocationUniform(s.shader.id, "colorMode");
         s.locDecim = rlGetLocationUniform(s.shader.id, "drawDecim");
+        s.locSel   = rlGetLocationUniform(s.shader.id, "selectedCamera");
     }
     glEnable(GL_PROGRAM_POINT_SIZE);
 
@@ -893,9 +925,22 @@ int main(int argc, char* argv[]) {
         }
 
         // Ctrl toggles point coloring: intensity (jet) <-> RGB
-        if (!ImGui::GetIO().WantCaptureKeyboard &&
-            (IsKeyPressed(KEY_LEFT_CONTROL) || IsKeyPressed(KEY_RIGHT_CONTROL)))
-            s.useImageColor = !s.useImageColor;
+        if (!ImGui::GetIO().WantCaptureKeyboard)
+        {
+            if (IsKeyPressed(KEY_LEFT_CONTROL) || IsKeyPressed(KEY_RIGHT_CONTROL))
+                s.useImageColor = !s.useImageColor;
+
+            if (IsKeyPressed(KEY_LEFT))
+            {
+                s.imgViewIdx = std::max(s.imgViewIdx - 1, 0);
+                s.imgViewRequest.store(s.imgViewIdx);
+            }
+            if (IsKeyPressed(KEY_RIGHT))
+            {
+                s.imgViewIdx = std::min(s.imgViewIdx + 1, (int)s.imageTsNs.size());
+                s.imgViewRequest.store(s.imgViewIdx);
+            }
+        }
 
         BeginDrawing();
         ClearBackground(Color{25, 25, 25, 255});
@@ -1004,6 +1049,9 @@ int main(int argc, char* argv[]) {
                     s.imgViewRequest.store(s.imgViewIdx);
                 }
                 ImGui::TextDisabled("ts: %lld", (long long)s.imageTsNs[s.imgViewIdx]);
+                ImGui::Checkbox("Only this camera's points", &s.isolateCamera);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Render only points colored by the selected image.\nNeeds 'Color by image (RGB)' enabled.");
                 if (s.imgViewLoading.load())
                     ImGui::TextColored(ImVec4(1,1,0,1), "Loading...");
                 else if (s.imgViewTexValid)
