@@ -76,6 +76,19 @@ MESSAGE(STATUS "Using bundled Eigen3 : ${EIGEN3_INCLUDE_DIR}")
 message("LASzip library")
 add_subdirectory(3rdparty/LASzip)
 
+# LASzip appends the major version to the lib name only on Windows (see
+# 3rdparty/LASzip/CMakeLists.txt), so the target is laszip3 there and laszip elsewhere.
+if(WIN32)
+    set(LASZIP_LIB laszip3)
+else()
+    set(LASZIP_LIB laszip)
+endif()
+
+# LASzip's bundled cmake pins its library target to C++11, but its mydefs.cpp uses
+# std::filesystem (C++17). Override the standard on the target here so we don't have
+# to modify the submodule; the target-level flag wins over the bundled -std=c++11.
+set_target_properties(${LASZIP_LIB} PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+
 file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/LASzip/dll/laszip_api.h 
      DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/LASzip/include/laszip/)
 file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/LASzip/include/laszip/laszip_common.h
@@ -90,7 +103,7 @@ include_directories(${LASZIP_INCLUDE})
 # Collect LASzip DLLs on Windows
 if(WIN32)
     set(LASZIP_DLLS
-        $<TARGET_FILE:laszip3>
+        $<TARGET_FILE:${LASZIP_LIB}>
     )
 endif()
 
@@ -136,7 +149,7 @@ target_link_libraries(CalibrationApp PRIVATE
     rlimgui
     nlohmann_json::nlohmann_json
     Eigen3::Eigen
-    laszip3
+    ${LASZIP_LIB}
     ${OpenCV_LIBS}
 )
 
@@ -162,7 +175,7 @@ endif()
 if(WIN32)
     add_custom_command(TARGET CalibrationApp POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        $<TARGET_FILE:laszip3>
+        $<TARGET_FILE:${LASZIP_LIB}>
         $<TARGET_FILE_DIR:CalibrationApp>
         COMMENT "Copying LASzip DLL to CalibrationApp output directory"
     )
@@ -177,7 +190,7 @@ add_executable(TrajectoryViewer
 )
 target_include_directories(TrajectoryViewer PRIVATE src ${LASZIP_INCLUDE})
 target_link_libraries(TrajectoryViewer PRIVATE
-    raylib imgui rlimgui nlohmann_json::nlohmann_json Eigen3::Eigen laszip3 ${OpenCV_LIBS})
+    raylib imgui rlimgui nlohmann_json::nlohmann_json Eigen3::Eigen ${LASZIP_LIB} ${OpenCV_LIBS})
 if(MSVC)
     target_compile_options(TrajectoryViewer PRIVATE /W4)
     target_compile_definitions(TrajectoryViewer PRIVATE _USE_MATH_DEFINES LASZIP_API_VERSION)
@@ -200,7 +213,7 @@ endif()
 if(WIN32)
     add_custom_command(TARGET TrajectoryViewer POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        $<TARGET_FILE:laszip3>
+        $<TARGET_FILE:${LASZIP_LIB}>
         $<TARGET_FILE_DIR:TrajectoryViewer>
         COMMENT "Copying LASzip DLL to TrajectoryViewer output directory"
     )
@@ -230,7 +243,7 @@ endif()
 if(WIN32)
     add_custom_command(TARGET IntrinsicsCalib POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        $<TARGET_FILE:laszip3>
+        $<TARGET_FILE:${LASZIP_LIB}>
         $<TARGET_FILE_DIR:IntrinsicsCalib>
         COMMENT "Copying LASzip DLL to IntrinsicsCalib output directory"
     )
