@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.28)
+cmake_minimum_required(VERSION 3.20)
 # Script tries to find OpenCV in system for Linux, downloads OpenCV release for Windows
 if(UNIX)
      find_package(OpenCV QUIET)
