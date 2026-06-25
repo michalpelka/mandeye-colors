@@ -136,6 +136,7 @@ add_executable(CalibrationApp
     src/UI.cpp
     src/Renderer.cpp
     src/Trajectory.cpp
+    src/CliArgs.cpp
 )
 
 target_include_directories(CalibrationApp PRIVATE
@@ -188,6 +189,7 @@ add_executable(TrajectoryViewer
     src/Camera.cpp
     src/PointCloud.cpp
     src/RosExport.cpp
+    src/CliArgs.cpp
 )
 target_include_directories(TrajectoryViewer PRIVATE src ${LASZIP_INCLUDE})
 target_link_libraries(TrajectoryViewer PRIVATE
@@ -252,7 +254,7 @@ else()
 endif()
 
 # ── IntrinsicsCalib ───────────────────────────────────────────────────────────
-add_executable(IntrinsicsCalib src/IntrinsicsCalib.cpp)
+add_executable(IntrinsicsCalib src/IntrinsicsCalib.cpp src/CliArgs.cpp)
 target_link_libraries(IntrinsicsCalib PRIVATE
     raylib imgui rlimgui nlohmann_json::nlohmann_json Eigen3::Eigen ${OpenCV_LIBS})
 if(MSVC)

@@ -8,6 +8,7 @@
 #include "Camera.h"
 #include "PointCloud.h"
 #include "RosExport.h"
+#include "CliArgs.h"
 #include <laszip/laszip_api.h>
 #include <nlohmann/json.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -22,6 +23,7 @@
 #include <iomanip>
 #include <cstring>
 #include <cstdint>
+#include <cstdio>
 #include <cmath>
 #include <thread>
 #include <mutex>
@@ -161,7 +163,7 @@ struct Orbit {
     }
 };
 
-struct ColorPt { float x, y, z; uint8_t r, g, b; };
+struct ColorPt { float x, y, z; uint8_t r, g, b; float intensity; int64_t ts_ns; };
 
 
 // ── Application state ─────────────────────────────────────────────────────────
@@ -508,7 +510,8 @@ static void loadCloud(State& s) {
             s.exportCloud.push_back({pw.x(), pw.y(), pw.z(),
                 (uint8_t)((packed >> 16) & 0xFF),
                 (uint8_t)((packed >>  8) & 0xFF),
-                (uint8_t)( packed        & 0xFF)});
+                (uint8_t)( packed        & 0xFF),
+                rawIntensity, pt.ts_ns});
 
             float d2 = pw.squaredNorm();
             if (d2 > mx*mx) mx = std::sqrt(d2);
@@ -585,8 +588,8 @@ static void exportLAZ(State& s) {
     header->version_minor            = 2;
     header->header_size              = 227;
     header->offset_to_point_data     = 227;
-    header->point_data_format        = 2;   // XYZ + RGB
-    header->point_data_record_length = 26;
+    header->point_data_format        = 3;   // XYZ + RGB + GPS time
+    header->point_data_record_length = 34;
     header->number_of_point_records  = (uint32_t)s.exportCloud.size();
     header->x_scale_factor = 0.001; header->y_scale_factor = 0.001; header->z_scale_factor = 0.001;
     header->x_offset = xmin; header->y_offset = ymin; header->z_offset = zmin;
@@ -611,6 +614,10 @@ static void exportLAZ(State& s) {
         point->rgb[0] = (laszip_U16)p.r << 8;
         point->rgb[1] = (laszip_U16)p.g << 8;
         point->rgb[2] = (laszip_U16)p.b << 8;
+        // intensity normalized [0,1] → LAS 16-bit field
+        point->intensity = (laszip_U16)(std::min(1.f, std::max(0.f, p.intensity)) * 65535.f);
+        // GPS time: ns since epoch → seconds (double)
+        point->gps_time = (laszip_F64)p.ts_ns * 1e-9;
         laszip_write_point(writer);
     }
 
@@ -858,10 +865,35 @@ static void drawScene(State& s) {
 
 // ── main ──────────────────────────────────────────────────────────────────────
 int main(int argc, char* argv[]) {
+    CliArgs args = parseArgs(argc, argv);
+    static const char* kDesc = "View LIO trajectory, colorize and export point clouds";
+    const std::vector<std::string> usage = {cliopt::MJS, cliopt::CAMERA_DIR, cliopt::CALIB};
+    if (args.help) {
+        printUsage("TrajectoryViewer", kDesc, usage);
+        return 0;
+    }
+    if (!args.valid) {
+        std::fprintf(stderr, "%s\n\n", args.error.c_str());
+        printUsage("TrajectoryViewer", kDesc, usage, /*toStderr=*/true);
+        return 1;
+    }
+
     State s;
-    if (argc > 1) strncpy(s.sessionBuf, argv[1], sizeof(s.sessionBuf)-1);
-    if (argc > 2) strncpy(s.calibBuf,   argv[2], sizeof(s.calibBuf)-1);
-    if (argc > 3) strncpy(s.cameraBuf,  argv[3], sizeof(s.cameraBuf)-1);
+    // --mjs gives the session manifest; the session directory is its parent.
+    std::string sessionDir;
+    if (args.has("mjs")) sessionDir = fs::path(args.get("mjs")).parent_path().string();
+    else if (!args.positional.empty()) sessionDir = args.positional.front();  // back-compat
+    if (!sessionDir.empty()) strncpy(s.sessionBuf, sessionDir.c_str(), sizeof(s.sessionBuf)-1);
+
+    if (args.has("camera_dir")) strncpy(s.cameraBuf, args.get("camera_dir").c_str(), sizeof(s.cameraBuf)-1);
+
+    // --calib: calibration json (intrinsic + extrinsic). Fall back to any
+    // positional ending in .json for backward compatibility.
+    std::string calib = args.get("calib");
+    if (calib.empty())
+        for (const auto& p : args.positional)
+            if (p.size() > 5 && p.substr(p.size()-5) == ".json") { calib = p; break; }
+    if (!calib.empty()) strncpy(s.calibBuf, calib.c_str(), sizeof(s.calibBuf)-1);
 
     SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_MSAA_4X_HINT);
     InitWindow(1400, 900, "Trajectory Viewer");

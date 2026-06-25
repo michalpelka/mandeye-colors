@@ -1,6 +1,8 @@
 #include "raylib.h"
 #include "rlImGui.h"
 #include "imgui.h"
+#include "CliArgs.h"
+#include <cstdio>
 #include <nlohmann/json.hpp>
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -245,9 +247,25 @@ static void refreshTex(State& s) {
 
 // ── entry point ───────────────────────────────────────────────────────────────
 int main(int argc, char* argv[]) {
+    CliArgs args = parseArgs(argc, argv);
+    if (args.help) {
+        printUsage("IntrinsicsCalib", "Camera intrinsics calibration from a folder of images",
+                   {cliopt::CAMERA_DIR});
+        return 0;
+    }
+    if (!args.valid) {
+        std::fprintf(stderr, "%s\n\n", args.error.c_str());
+        printUsage("IntrinsicsCalib", "Camera intrinsics calibration from a folder of images",
+                   {cliopt::CAMERA_DIR}, /*toStderr=*/true);
+        return 1;
+    }
+
     State state;
-    if (argc > 1) {
-        strncpy(state.dirBuf, argv[1], sizeof(state.dirBuf) - 1);
+    // --camera_dir, or the first positional, selects the image folder.
+    std::string dir = args.has("camera_dir") ? args.get("camera_dir")
+                    : (!args.positional.empty() ? args.positional.front() : std::string{});
+    if (!dir.empty()) {
+        strncpy(state.dirBuf, dir.c_str(), sizeof(state.dirBuf) - 1);
         loadDir(state);
     }
 
