@@ -23,6 +23,14 @@ struct Extrinsics {
     float rx = -90.f, ry = 0.f, rz = -90.f;
 };
 
+// Rectangular region of interest, in full-resolution image pixels.
+// When enabled, only pixels inside [x, x+w) x [y, y+h) are considered valid
+// (e.g. for coloring a point cloud); everything outside is ignored.
+struct Roi {
+    bool enabled = false;
+    int  x = 0, y = 0, w = 0, h = 0;
+};
+
 // R = Rz * Ry * Rx  (ZYX Euler, degrees → rotation matrix)
 Eigen::Matrix3f eulerZYXtoMat3(float rx_deg, float ry_deg, float rz_deg);
 

@@ -31,6 +31,80 @@
 
 namespace fs = std::filesystem;
 
+Eigen::Matrix4d getInterpolatedPose(const std::map<double, Eigen::Matrix4d>& trajectory, double query_time)
+{
+    Eigen::Matrix4d ret(Eigen::Matrix4d::Zero());
+    auto it_lower = trajectory.lower_bound(query_time);
+    auto it_next = it_lower;
+
+    if (it_lower == trajectory.begin())
+    {
+        return ret;
+    }
+    if (it_lower->first > query_time)
+    {
+        it_lower = std::prev(it_lower);
+    }
+    if (it_lower == trajectory.begin())
+    {
+        return ret;
+    }
+    if (it_lower == trajectory.end())
+    {
+        return ret;
+    }
+
+    double t1 = it_lower->first;
+    double t2 = it_next->first;
+    double difft1 = t1 - query_time;
+    double difft2 = t2 - query_time;
+    if (t1 == t2 && std::fabs(difft1) < 0.1)
+    {
+        ret = Eigen::Matrix4d::Identity();
+        ret.col(3).head<3>() = it_next->second.col(3).head<3>();
+        ret.topLeftCorner(3, 3) = it_lower->second.topLeftCorner(3, 3);
+        return ret;
+    }
+
+    // if (std::fabs(difft1) < 0.15 && std::fabs(difft2) < 0.15)
+    {
+        assert(t2 > t1);
+        assert(query_time > t1);
+        assert(query_time < t2);
+        ret = Eigen::Matrix4d::Identity();
+        double res = (query_time - t1) / (t2 - t1);
+        Eigen::Vector3d diff = it_next->second.col(3).head<3>() - it_lower->second.col(3).head<3>();
+        ret.col(3).head<3>() = it_next->second.col(3).head<3>() + diff * res;
+        Eigen::Matrix3d r1 = it_lower->second.topLeftCorner(3, 3).matrix();
+        Eigen::Matrix3d r2 = it_next->second.topLeftCorner(3, 3).matrix();
+        Eigen::Quaterniond q1(r1);
+        Eigen::Quaterniond q2(r2);
+        Eigen::Quaterniond qt = q1.slerp(res, q2);
+        ret.topLeftCorner(3, 3) = qt.toRotationMatrix();
+        return ret;
+    }
+
+    return ret;
+}
+
+// Build a time(seconds) -> T_world_lidar map suitable for getInterpolatedPose().
+static std::map<double, Eigen::Matrix4d> buildTrajMap(const Trajectory& traj) {
+    std::map<double, Eigen::Matrix4d> m;
+    for (const auto& p : traj.poses)
+        m[p.ts_ns * 1e-9] = p.T.matrix().cast<double>();
+    return m;
+}
+
+// Interpolated T_world_lidar at ts_ns. Returns false when ts_ns lies outside the
+// trajectory range — getInterpolatedPose() signals that with a zero matrix.
+static bool interpPose(const std::map<double, Eigen::Matrix4d>& trajMap,
+                       int64_t ts_ns, Eigen::Affine3f& out) {
+    Eigen::Matrix4d T = getInterpolatedPose(trajMap, ts_ns * 1e-9);
+    if (T(3, 3) == 0.0) return false;
+    out.matrix() = T.cast<float>();
+    return true;
+}
+
 // ── GPU point cloud shader ────────────────────────────────────────────────────
 // colorPacked: float bits = 0x00RRGGBB; colorMode: 0=jet depth, 1=RGB
 static const char* kVS = R"(
@@ -77,19 +151,17 @@ vec3 jet(float t) {
                       1.5 - abs(4.0*t - 1.0)), 0.0, 1.0);
 }
 void main() {
+    if (selectedCamera >= 0)
+    {
+        if (selectedCamera != int(fragColorCameraId))
+            discard; // do not draw
+    }
+
     if (colorMode == 1)
     {
-        if (selectedCamera < 0)
-        {
-            finalColor = vertColor;
-        }
-        else
-        {
-            if (selectedCamera == int(fragColorCameraId))
-                finalColor = vertColor;
-            else
-                discard;   // render only points colored from the selected camera
-        }
+        if (fragColorCameraId < 0.0)
+            discard; // not colored by any image — draw only colored points
+        finalColor = vertColor;
     }
     else finalColor = vec4(jet(fragIntensity), 1.0);
 }
@@ -172,6 +244,7 @@ struct State {
     std::vector<int64_t> imageTsNs;
     Intrinsics           K;
     Extrinsics           E;
+    Roi                  roi;
     bool                 calibLoaded = false;
     int                  imgW = 4656, imgH = 3496;
 
@@ -367,10 +440,13 @@ static void loadCloud(State& s) {
 
     struct ImgEntry {
         int64_t         ts;
-        const TrajPose* pose;
+        Eigen::Affine3f pose;       // T_world_lidar at the image time (interpolated)
         cv::Mat         img;
         int             globalIdx;  // index into s.imageTsNs (== imgViewIdx / selectedCamera)
     };
+
+    // time(s) -> T_world_lidar, for interpolating the pose at each image time.
+    std::map<double, Eigen::Matrix4d> trajMap = buildTrajMap(s.traj);
 
     std::vector<float> gpuData;
     float mx = 0.f;
@@ -411,8 +487,8 @@ static void loadCloud(State& s) {
                     int64_t imgTs = *it;
                     auto fnIt = s.imagesFilenamesInTime.find(imgTs);
                     if (fnIt == s.imagesFilenamesInTime.end()) continue;
-                    const TrajPose* pose = s.traj.nearest(imgTs);
-                    if (!pose) continue;
+                    Eigen::Affine3f pose;
+                    if (!interpPose(trajMap, imgTs, pose)) continue;
                     cv::Mat img = cv::imread(fnIt->second);
                     if (img.empty()) continue;
                     int gidx = (int)(it - s.imageTsNs.begin());
@@ -429,8 +505,8 @@ static void loadCloud(State& s) {
                 }
                 int64_t imgTs = *it;
                 auto fnIt = s.imagesFilenamesInTime.find(imgTs);
-                const TrajPose* pose = s.traj.nearest(imgTs);
-                if (fnIt != s.imagesFilenamesInTime.end() && pose) {
+                Eigen::Affine3f pose;
+                if (fnIt != s.imagesFilenamesInTime.end() && interpPose(trajMap, imgTs, pose)) {
                     cv::Mat img = cv::imread(fnIt->second);
                     int gidx = (int)(it - s.imageTsNs.begin());
                     if (!img.empty()) chunkImgs.push_back({imgTs, pose, std::move(img), gidx});
@@ -481,12 +557,16 @@ static void loadCloud(State& s) {
                 auto tryImg = [&](int idx) -> bool {
                     if (idx < 0 || idx >= nImgs) return false;
                     auto& e = chunkImgs[idx];
-                    Eigen::Vector3f pl  = e.pose->T.inverse() * pw;
+                    Eigen::Vector3f pl  = e.pose.inverse() * pw;
                     Eigen::Vector3f pc_ = R_wc.transpose() * (pl - C);
                     if (pc_.z() <= 0.05f) return false;
                     int iu = (int)std::round(K_fx * pc_.x() / pc_.z() + K_cx);
                     int iv = (int)std::round(K_fy * pc_.y() / pc_.z() + K_cy);
                     if (iu < 0 || iu >= e.img.cols || iv < 0 || iv >= e.img.rows) return false;
+                    // outside the region of interest? leave the point uncolored
+                    if (s.roi.enabled &&
+                        (iu < s.roi.x || iu >= s.roi.x + s.roi.w ||
+                         iv < s.roi.y || iv >= s.roi.y + s.roi.h)) return false;
                     cv::Vec3b bgr = e.img.at<cv::Vec3b>(iv, iu);
                     uint32_t p = (uint32_t(bgr[2]) << 16) | (uint32_t(bgr[1]) << 8) | uint32_t(bgr[0]);
                     std::memcpy(&colorF, &p, 4);
@@ -494,12 +574,7 @@ static void loadCloud(State& s) {
                     return true;
                 };
 
-                if (!tryImg(startIdx)) {
-                    for (int delta = 1; delta < nImgs; ++delta) {
-                        if (tryImg(startIdx + delta)) break;
-                        if (tryImg(startIdx - delta)) break;
-                    }
-                }
+                tryImg(startIdx);
             }
 
             gpuData.push_back(colorF);
@@ -561,6 +636,18 @@ static void loadCalib(State& s) {
             s.E.ry = je["camera_rotation_in_world_euler_zyx_deg"][1];
             s.E.rx = je["camera_rotation_in_world_euler_zyx_deg"][2];
         }
+    }
+    // Optional region of interest, in full-resolution image pixels:
+    //   "roi": { "x": 0, "y": 0, "w": 4656, "h": 3496, "enabled": true }
+    // "enabled" defaults to true when the object is present; it only takes
+    // effect once w and h are positive.
+    if (j.contains("roi")) {
+        auto& jr = j["roi"];
+        s.roi.x = jr.value("x", 0);
+        s.roi.y = jr.value("y", 0);
+        s.roi.w = jr.value("w", 0);
+        s.roi.h = jr.value("h", 0);
+        s.roi.enabled = jr.value("enabled", true) && s.roi.w > 0 && s.roi.h > 0;
     }
     s.calibLoaded = true;
     s.status = "Calibration loaded";
@@ -663,11 +750,12 @@ static void exportColmap(State& s) {
         f << "# Image list with two lines of data per image:\n"
              "#   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n"
              "#   POINTS2D[] as (X, Y, POINT3D_ID)\n";
+        auto trajMap = buildTrajMap(s.traj);
         int id = 1;
         for (auto& [ts, path] : s.imagesFilenamesInTime) {
-            const TrajPose* pose = s.traj.nearest(ts);
-            if (!pose) continue;
-            Eigen::Affine3f T_wc = pose->T * T_lc;     // camera in world
+            Eigen::Affine3f pose;
+            if (!interpPose(trajMap, ts, pose)) continue;
+            Eigen::Affine3f T_wc = pose * T_lc;        // camera in world
             Eigen::Affine3f T_cw = T_wc.inverse();      // world -> camera
             Eigen::Quaternionf q(T_cw.linear()); q.normalize();
             Eigen::Vector3f t = T_cw.translation();
@@ -852,7 +940,7 @@ static void drawScene(State& s) {
         int cm = s.useImageColor ? 1 : 0;
         rlSetUniform(s.locCM,    &cm,          RL_SHADER_UNIFORM_INT, 1);
         rlSetUniform(s.locDecim, &s.drawDecim, RL_SHADER_UNIFORM_INT, 1);
-        int sel = (s.isolateCamera && s.useImageColor &&
+        int sel = (s.isolateCamera &&
                    s.imgViewIdx >= 0 && s.imgViewIdx < (int)s.imageTsNs.size())
                   ? s.imgViewIdx : -1;
         rlSetUniform(s.locSel, &sel, RL_SHADER_UNIFORM_INT, 1);
@@ -1048,6 +1136,21 @@ int main(int argc, char* argv[]) {
                 ImGui::Text("cx=%.0f cy=%.0f", s.K.cx, s.K.cy);
                 ImGui::InputInt("Image W", &s.imgW);
                 ImGui::InputInt("Image H", &s.imgH);
+                ImGui::Separator();
+                if (ImGui::Checkbox("Region of interest", &s.roi.enabled)) {
+                    // first enable with an empty ROI: default to the full image
+                    if (s.roi.enabled && (s.roi.w <= 0 || s.roi.h <= 0)) {
+                        s.roi.x = 0; s.roi.y = 0; s.roi.w = s.imgW; s.roi.h = s.imgH;
+                    }
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Only points projecting inside the ROI get colored.\nDrawn on the image preview.");
+                if (s.roi.enabled) {
+                    ImGui::InputInt("ROI x", &s.roi.x);
+                    ImGui::InputInt("ROI y", &s.roi.y);
+                    ImGui::InputInt("ROI w", &s.roi.w);
+                    ImGui::InputInt("ROI h", &s.roi.h);
+                }
             }
             ImGui::PopItemWidth();
         }
@@ -1181,7 +1284,18 @@ int main(int argc, char* argv[]) {
             int dispW = (int)avail.x;
             int dispH = (int)(avail.x * aspect);
             if (dispH > (int)avail.y) { dispH = (int)avail.y; dispW = (int)(avail.y / aspect); }
+            ImVec2 imgPos = ImGui::GetCursorScreenPos();
             rlImGuiImageSize(&s.imgViewTex, dispW, dispH);
+            // overlay the ROI, mapping full-res image pixels to the displayed rect
+            if (s.roi.enabled && s.imgViewTex.width > 0 && s.imgViewTex.height > 0) {
+                float sx = (float)dispW / s.imgViewTex.width;
+                float sy = (float)dispH / s.imgViewTex.height;
+                ImVec2 a(imgPos.x + s.roi.x * sx, imgPos.y + s.roi.y * sy);
+                ImVec2 b(imgPos.x + (s.roi.x + s.roi.w) * sx,
+                         imgPos.y + (s.roi.y + s.roi.h) * sy);
+                ImGui::GetWindowDrawList()->AddRect(a, b, IM_COL32(0, 255, 0, 255),
+                                                    /*rounding=*/0.f, /*thickness=*/2.f);
+            }
             ImGui::End();
         }
 
