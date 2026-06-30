@@ -106,19 +106,21 @@ static bool interpPose(const std::map<double, Eigen::Matrix4d>& trajMap,
 }
 
 // ── GPU point cloud shader ────────────────────────────────────────────────────
-// colorPacked: float bits = 0x00RRGGBB; colorMode: 0=jet depth, 1=RGB
+// colorPacked: float bits = 0x00RRGGBB; colorMode: 0=jet depth, 1=RGB, 2=camera id, 3=in ROI
 static const char* kVS = R"(
 #version 330
 layout(location = 0) in vec3  pos;
 layout(location = 1) in float colorPacked;
 layout(location = 2) in float lidarIntensity;
 layout(location = 3) in float colorCameraId;   // global image index that colored this point, or -1
+layout(location = 4) in float inRoi;           // 1=inside ROI, 0=outside ROI, -1=projects into no image
 uniform mat4  mvp;
 uniform float pointSize;
 uniform int   drawDecim;
 out float fragIntensity;
 out vec4 vertColor;
 flat out float fragColorCameraId;
+flat out float fragInRoi;
 void main() {
     if (drawDecim > 1 && (gl_VertexID % drawDecim) != 0) {
         gl_Position  = vec4(2.0, 2.0, 2.0, 1.0);
@@ -134,6 +136,7 @@ void main() {
     fragIntensity = lidarIntensity;
     vertColor = vec4(r, g, b, 1.0);
     fragColorCameraId = colorCameraId;
+    fragInRoi = inRoi;
 }
 )";
 static const char* kFS = R"(
@@ -141,6 +144,7 @@ static const char* kFS = R"(
 in float fragIntensity;
 in vec4 vertColor;
 flat in float fragColorCameraId;
+flat in float fragInRoi;
 uniform int colorMode;
 uniform int selectedCamera;   // -1 = show all, else keep only points from this image
 out vec4 finalColor;
@@ -149,6 +153,17 @@ vec3 jet(float t) {
     return clamp(vec3(1.5 - abs(4.0*t - 3.0),
                       1.5 - abs(4.0*t - 2.0),
                       1.5 - abs(4.0*t - 1.0)), 0.0, 1.0);
+}
+vec3 hsv2rgb(vec3 c) {
+    vec4 K = vec4(1.0, 2.0/3.0, 1.0/3.0, 3.0);
+    vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+    return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+}
+// deterministic, well-spread color per integer camera id
+vec3 idColor(float idf) {
+    float id = floor(idf + 0.5);
+    float hue = fract(id * 0.61803398875); // golden ratio
+    return hsv2rgb(vec3(hue, 0.85, 1.0));
 }
 void main() {
     if (selectedCamera >= 0)
@@ -162,6 +177,22 @@ void main() {
         if (fragColorCameraId < 0.0)
             discard; // not colored by any image — draw only colored points
         finalColor = vertColor;
+    }
+    else if (colorMode == 2)
+    {
+        if (fragColorCameraId < 0.0)
+            discard; // not colored by any image — draw only colored points
+        finalColor = vec4(idColor(fragColorCameraId), 1.0);
+    }
+    else if (colorMode == 3)
+    {
+        // ROI membership: green = inside ROI, red = projects into an image but
+        // outside ROI, dim gray = projects into no image (spatial context).
+        if (fragInRoi < 0.0)
+            finalColor = vec4(0.28, 0.28, 0.28, 1.0);
+        else
+            finalColor = (fragInRoi > 0.5) ? vec4(0.15, 0.9, 0.2, 1.0)
+                                           : vec4(0.9, 0.15, 0.15, 1.0);
     }
     else finalColor = vec4(jet(fragIntensity), 1.0);
 }
@@ -179,7 +210,7 @@ struct GpuCloud {
         vao = rlLoadVertexArray();
         rlEnableVertexArray(vao);
         vbo = rlLoadVertexBuffer(data.data(), (int)(data.size()*sizeof(float)), false);
-        const int stride = 6 * sizeof(float);
+        const int stride = 7 * sizeof(float);
         rlSetVertexAttribute(0, 3, RL_FLOAT, false, stride, 0);
         rlEnableVertexAttribute(0);
         rlSetVertexAttribute(1, 1, RL_FLOAT, false, stride, 3*sizeof(float));
@@ -188,8 +219,10 @@ struct GpuCloud {
         rlEnableVertexAttribute(2);
         rlSetVertexAttribute(3, 1, RL_FLOAT, false, stride, 5*sizeof(float));
         rlEnableVertexAttribute(3);
+        rlSetVertexAttribute(4, 1, RL_FLOAT, false, stride, 6*sizeof(float));
+        rlEnableVertexAttribute(4);
         rlDisableVertexArray();
-        count = (int)(data.size() / 6);
+        count = (int)(data.size() / 7);
     }
     void unload() {
         if (vao) { rlUnloadVertexArray(vao); vao = 0; }
@@ -264,10 +297,15 @@ struct State {
     bool  isolateCamera = false;   // render only points colored by the selected (preview) image
     float frustumScale  = 0.5f;
     float pointSize     = 2.f;
-    int   cloudDecim      = 1;
+    int   cloudDecim      = 5;
     int   drawDecim       = 1;
     bool  multiImgColoring = true;  // false = single image per chunk (midpoint)
-    bool  useImageColor   = false;
+    float maxTemporalDist  = 0.5f;  // s: skip images farther than this from the point
+    int   maxWiggle        = 1;     // frames: search startIdx ± maxWiggle for a frustum hit
+    bool  useImageColor   = false;  // true once a colorize pass produced RGB data
+    int   colorMode        = 0;     // 0=intensity (jet), 1=RGB by image, 2=camera id
+    int   coloredPts       = 0;  // points that received RGB from an image
+    int   uncoloredPts     = 0;  // points left as intensity-gray (no image / out of frustum / outside ROI)
 
     char  sessionBuf[512] = {};
     char  calibBuf[512]   = {};
@@ -453,6 +491,7 @@ static void loadCloud(State& s) {
     float sumX = 0, sumY = 0, sumZ = 0; int cnt = 0;
     int step = std::max(1, s.cloudDecim);
     int coloredChunks = 0;
+    int coloredPts = 0, uncoloredPts = 0;
 
     for (auto& lp : lazPaths) {
         std::string key = lp.stem().string();   // "scan_lio_N"
@@ -496,7 +535,7 @@ static void loadCloud(State& s) {
                 }
             } else {
                 // legacy: single image nearest to chunk midpoint
-                int64_t mid = (chunkFirst + chunkLast) / 2;
+                int64_t mid = chunkFirst;
                 auto it = std::lower_bound(s.imageTsNs.begin(), s.imageTsNs.end(), mid);
                 if (it == s.imageTsNs.end()) --it;
                 else if (it != s.imageTsNs.begin()) {
@@ -537,6 +576,7 @@ static void loadCloud(State& s) {
             const float rawIntensity = pt.intensity;
             float colorF = packGray(rawIntensity);
             float camIdF = -1.f;   // which image colored this point (global index), -1 = none
+            float inRoiF = -1.f;   // 1=inside ROI, 0=outside ROI, -1=projects into no image
 
             if (nImgs > 0) {
                 // nearest image by point timestamp
@@ -552,8 +592,6 @@ static void loadCloud(State& s) {
                     }
                     startIdx = (int)(it - chunkImgs.begin());
                 }
-
-                // try images expanding outward from startIdx; first frustum hit wins
                 auto tryImg = [&](int idx) -> bool {
                     if (idx < 0 || idx >= nImgs) return false;
                     auto& e = chunkImgs[idx];
@@ -563,10 +601,16 @@ static void loadCloud(State& s) {
                     int iu = (int)std::round(K_fx * pc_.x() / pc_.z() + K_cx);
                     int iv = (int)std::round(K_fy * pc_.y() / pc_.z() + K_cy);
                     if (iu < 0 || iu >= e.img.cols || iv < 0 || iv >= e.img.rows) return false;
+                    // point projects into this image — record ROI membership so
+                    // the "In ROI" render mode can show it, independent of whether
+                    // the ROI filter is currently enabled.
+                    bool haveRoi = s.roi.w > 0 && s.roi.h > 0;
+                    bool insideRoi = !haveRoi ||
+                        (iu >= s.roi.x && iu < s.roi.x + s.roi.w &&
+                         iv >= s.roi.y && iv < s.roi.y + s.roi.h);
+                    inRoiF = insideRoi ? 1.f : 0.f;
                     // outside the region of interest? leave the point uncolored
-                    if (s.roi.enabled &&
-                        (iu < s.roi.x || iu >= s.roi.x + s.roi.w ||
-                         iv < s.roi.y || iv >= s.roi.y + s.roi.h)) return false;
+                    if (s.roi.enabled && !insideRoi) return false;
                     cv::Vec3b bgr = e.img.at<cv::Vec3b>(iv, iu);
                     uint32_t p = (uint32_t(bgr[2]) << 16) | (uint32_t(bgr[1]) << 8) | uint32_t(bgr[0]);
                     std::memcpy(&colorF, &p, 4);
@@ -574,12 +618,21 @@ static void loadCloud(State& s) {
                     return true;
                 };
 
-                tryImg(startIdx);
+                // Wiggle around the temporally-nearest image: try startIdx, then
+                // its immediate neighbours (-1, +1), stopping as soon as the
+                // point lands inside a frustum. Only consider the nearest image if
+                // it is within 0.5 s of the point.
+                const int64_t kMaxDtNs = 500000000;  // 0.5 s
+                if (std::abs(pt.ts_ns - chunkImgs[startIdx].ts) <= kMaxDtNs) {
+                    tryImg(startIdx) || tryImg(startIdx - 1) || tryImg(startIdx + 1);
+                }
             }
+            if (camIdF >= 0.f) ++coloredPts; else ++uncoloredPts;
 
             gpuData.push_back(colorF);
             gpuData.push_back(rawIntensity);
             gpuData.push_back(camIdF);
+            gpuData.push_back(inRoiF);
 
             uint32_t packed; std::memcpy(&packed, &colorF, 4);
             s.exportCloud.push_back({pw.x(), pw.y(), pw.z(),
@@ -595,6 +648,9 @@ static void loadCloud(State& s) {
         // chunkImgs and their cv::Mat memory are released here
     }
     s.useImageColor = canColor && (coloredChunks > 0);
+    if (s.useImageColor) s.colorMode = 1;  // default to RGB display once RGB data is available
+    s.coloredPts   = coloredPts;
+    s.uncoloredPts = uncoloredPts;
 
     if (cnt > 0) {
         s.cloud.upload(gpuData, mx);
@@ -606,6 +662,12 @@ static void loadCloud(State& s) {
              + "  Poses: "+ std::to_string(s.traj.poses.size())
              + "  Imgs/chunk: " + std::to_string(coloredChunks > 0 ? coloredChunks : 0)
              + (s.useImageColor ? "  +RGB" : "");
+    if (s.useImageColor && cnt > 0) {
+        double pct = 100.0 * coloredPts / cnt;
+        s.status += "  | Colored: " + std::to_string(coloredPts)
+                  + "  Uncolored: " + std::to_string(uncoloredPts)
+                  + "  (" + std::to_string((int)std::lround(pct)) + "%)";
+    }
 }
 
 static void loadCalib(State& s) {
@@ -937,8 +999,7 @@ static void drawScene(State& s) {
         rlEnableShader(s.shader.id);
         rlSetUniformMatrix(s.locMVP, mvp);
         rlSetUniform(s.locPS, &s.pointSize, RL_SHADER_UNIFORM_FLOAT, 1);
-        int cm = s.useImageColor ? 1 : 0;
-        rlSetUniform(s.locCM,    &cm,          RL_SHADER_UNIFORM_INT, 1);
+        rlSetUniform(s.locCM,    &s.colorMode, RL_SHADER_UNIFORM_INT, 1);
         rlSetUniform(s.locDecim, &s.drawDecim, RL_SHADER_UNIFORM_INT, 1);
         int sel = (s.isolateCamera &&
                    s.imgViewIdx >= 0 && s.imgViewIdx < (int)s.imageTsNs.size())
@@ -1048,7 +1109,7 @@ int main(int argc, char* argv[]) {
         if (!ImGui::GetIO().WantCaptureKeyboard)
         {
             if (IsKeyPressed(KEY_LEFT_CONTROL) || IsKeyPressed(KEY_RIGHT_CONTROL))
-                s.useImageColor = !s.useImageColor;
+                s.colorMode = (s.colorMode == 1) ? 0 : 1;
 
             if (IsKeyPressed(KEY_LEFT))
             {
@@ -1163,9 +1224,20 @@ int main(int argc, char* argv[]) {
             ImGui::SliderInt("Draw decimation", &s.drawDecim,    1,    64);
             if (!s.imagesFilenamesInTime.empty()) {
                 ImGui::Separator();
-                ImGui::Checkbox("Color by image (RGB)", &s.useImageColor);
+                ImGui::Text("Point color:");
+                ImGui::RadioButton("Intensity", &s.colorMode, 0);
+                ImGui::SameLine();
+                ImGui::RadioButton("RGB (image)", &s.colorMode, 1);
                 if (ImGui::IsItemHovered())
                     ImGui::SetTooltip("Ctrl toggles intensity (jet) <-> RGB");
+                ImGui::SameLine();
+                ImGui::RadioButton("Camera ID", &s.colorMode, 2);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Colors each point by the image that colored it");
+                ImGui::SameLine();
+                ImGui::RadioButton("In ROI", &s.colorMode, 3);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Green = projects inside the ROI, red = outside.\nPoints projecting into no image are hidden.");
             }
         }
 
